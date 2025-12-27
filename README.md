@@ -155,9 +155,24 @@ npx -y @coreyuan/vector-mind
 
 配置完成后，客户端会在初始化阶段拿到该服务器的 tools + instructions；AI 就能“知道它存在”，并在需要时调用，而不是盲猜。
 
-## Claude Skills（Claude Code / myclaude）
+## Skills（可选：让用户“无感”自动调用）
 
-如果你使用的是 Claude Code（或类似 myclaude 的 skills 机制），把仓库里的 `skills/vector-mind` 复制到你的 `~/.claude/skills/vector-mind`（Windows: `C:\Users\<you>\.claude\skills\vector-mind`），重启后就会被识别为一个 Skill。
+> 说明：Skill 不是跨所有 AI 通用标准，不同客户端的“Skill”格式不同；但 MCP Server 本身是通用的（支持 MCP 的客户端都能用）。
+
+### Codex Skills（OpenAI Codex）
+
+- 安装：把 `skills/vector-mind-autopilot` 复制到 `~/.codex/skills/vector-mind-autopilot`（Windows: `C:\Users\<you>\.codex\skills\vector-mind-autopilot`），或直接使用打包文件 `skill-dist/vector-mind-autopilot.skill`
+- 使用：重启后正常聊天即可；如未触发，可在对话里提一次 `$vector-mind-autopilot`
+
+### Claude Skills（Claude Code / myclaude）
+
+- 安装：把仓库里的 `skills/vector-mind` 复制到 `~/.claude/skills/vector-mind`（Windows: `C:\Users\<you>\.claude\skills\vector-mind`）
+- 使用：重启后就会被识别为一个 Skill（可配合 `.claude/skills/skill-rules.json` 加关键词触发）
+
+### Claude Desktop（Project Instructions）
+
+- MCP 配置参考：`skills/vector-mind-autopilot/references/claude-desktop-mcp-config.json`
+- 指令参考（复制到 Project Instructions / Custom Instructions）：`skills/vector-mind-autopilot/references/claude-project-instructions.md`
 
 ## 典型示例
 
