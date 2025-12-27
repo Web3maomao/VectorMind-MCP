@@ -15,14 +15,19 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 - **需求追踪（requirements）**：在写代码前创建/激活一个需求，明确目标与业务背景。
 - **改动意图归档（change_logs）**：每次保存后把“改动意图 + 影响文件”写入数据库，并关联到当前激活需求。
 - **符号索引（symbols）**：实时维护类/函数/类型等符号表，用于快速 query 定位定义位置。
+- **项目总结 & 笔记（memory_items）**：把“项目总结/关键决策/约束/待办”等上下文以结构化条目持久化到本地。
+- **代码片段 & 文档分块索引（memory_items）**：监听文件变更，把代码/文档切成可检索的 chunk 存入本地。
+- **语义检索（embeddings + semantic_search）**：使用本地 embedding 模型把上述内容向量化，支持跨需求/意图/笔记/代码/文档的语义召回。
 - **会话恢复（brain dump）**：新会话开始时一键拉取最近需求与对应的改动意图，AI 直接接着做。
 
 ## 工作流（强烈推荐）
 
-1) **新会话开始**：AI 先调用 `get_brain_dump()` 恢复上下文  
+1) **新会话开始**：AI 先调用 `bootstrap_context({ query: 当前目标 })`（或 `get_brain_dump()`）恢复上下文并做一次语义召回  
 2) **准备开始写代码前**：AI 调用 `start_requirement(title, background)`  
-3) **每次改完并保存后**：AI 调用 `sync_change_intent(intent, files)` 归档本次意图  
-4) **需要找代码定义时**：AI 调用 `query_codebase(query)`（不要靠猜）
+3) **每次改完并保存后**：AI 调用 `get_pending_changes()` 查看待同步文件，再调用 `sync_change_intent(intent, files)`（可省略 files 让服务端自动关联所有 pending）  
+4) **阶段性收口**（重要）：AI 在对话里写好总结，然后调用 `upsert_project_summary(summary)`/`add_note(...)` 持久化  
+5) **需要找代码定义时**：AI 调用 `query_codebase(query)`（不要靠猜）  
+6) **需要按语义找上下文/代码/文档时**：AI 调用 `semantic_search(query, ...)`（不要靠猜）
 
 > 本 MCP Server 会在初始化时下发 `instructions`，提示 AI 按以上流程调用工具（避免盲猜）。
 
@@ -35,21 +40,51 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 ### `sync_change_intent`
 - 入参：`{ intent: string, files?: string[], affected_files?: string[] }`
 - 用途：把“这次改动的意图摘要”写入 `change_logs`，并与当前激活需求关联  
-- 说明：如果没有激活需求，会返回错误并提示先 `start_requirement`
+- 说明：如果不传 `files`，服务端会自动把“最近未同步的文件变更（pending）”关联到本次意图；如果没有激活需求，会返回错误并提示先 `start_requirement`
 
 ### `get_brain_dump`
 - 入参：`{}`
 - 用途：返回最近 5 个需求，以及每个需求最近的改动意图（用于会话恢复）
 
+### `bootstrap_context`
+- 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean }`
+- 用途：返回 brain dump + pending changes；如果传入 `query`，会额外返回本地向量库的语义检索结果（推荐新会话开始就用它）
+
+### `get_pending_changes`
+- 入参：`{}`
+- 用途：返回本地“已发生变更但尚未被 sync_change_intent 确认”的文件列表（便于 AI 不漏同步）
+
 ### `query_codebase`
 - 入参：`{ query: string }`
 - 用途：按名称/签名模糊搜索 `symbols`，返回匹配的 `file_path` 与 `signature`
 
+### `upsert_project_summary`
+- 入参：`{ summary: string }`
+- 用途：保存/更新“项目级上下文总结”（由 AI 在对话里写好再保存），用于跨会话快速恢复
+
+### `add_note`
+- 入参：`{ title?: string, content: string, tags?: string[] }`
+- 用途：保存一条“可持久化的项目笔记”（决策、约束、TODO、架构说明等）
+
+### `semantic_search`
+- 入参：`{ query: string, top_k?: number, kinds?: string[], include_content?: boolean }`
+- 用途：对本地向量库进行语义检索（覆盖需求/意图/笔记/项目总结/代码 chunk/文档 chunk）
+
 ## 本地数据与监听
 
-- 数据库：在当前项目根目录创建 `.vectormind.db`（默认已在 `.gitignore` 中忽略）
-- 监听范围：`process.cwd()` 下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
+- 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind.db`（默认已在 `.gitignore` 中忽略）
+- 监听范围：默认监听 workspace root（同上）下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
+- 语义向量：默认使用本地 embedding 模型（`@xenova/transformers`），首次运行可能需要下载模型权重（无云端 API 调用，向量与数据都保存在本地）
+
+## 向量化配置（可选）
+
+- `VECTORMIND_ROOT=...`：强制指定“项目根目录”（当你的 MCP Client 无法提供 workspace roots 或启动目录不对时使用）
+- `VECTORMIND_EMBEDDINGS=off`：关闭向量化（`semantic_search` 不可用）
+- `VECTORMIND_EMBED_FILES=all|changed|none`：是否向量化代码/文档 chunk（默认 `all`）
+- `VECTORMIND_EMBED_MODEL=...`：指定 embedding 模型（默认 `Xenova/all-MiniLM-L6-v2`）
+- `VECTORMIND_EMBED_CACHE_DIR=...`：指定模型缓存目录
+- `VECTORMIND_ALLOW_REMOTE_MODELS=false`：禁止下载远端模型（适合离线环境）
 
 ## 安装与运行
 
@@ -61,10 +96,32 @@ npm run build
 node dist/index.js
 ```
 
+## 发布到 NPM（建议）
+
+1) 修改 `package.json` 的 `name` 为你的实际包名（例如 `@coreyuan/vector-mind`）  
+2) 登录并发布：
+
+```bash
+npm login
+npm publish
+```
+
+> 说明：已配置 `prepublishOnly`（发布前自动 `npm run build`）与 `publishConfig.access=public`（适用于 scoped 包）。
+
+## 快速测试（Smoke）
+
+```bash
+# 只测工具/索引/同步流程（不下载 embedding 模型）
+npm run smoke
+
+# 测试向量化 + 语义检索（首次会下载本地模型权重）
+npm run smoke -- --embeddings=on
+```
+
 ### 以 NPM 包方式运行（发布后）
 
 ```bash
-npx -y @your-org/vector-mind
+npx -y @coreyuan/vector-mind
 ```
 
 ## 在 MCP Client 中配置（stdio）
@@ -77,7 +134,24 @@ npx -y @your-org/vector-mind
 
 - 发布后（示例）：
   - `command`: `npx`
-  - `args`: `["-y", "@your-org/vector-mind"]`
+  - `args`: `["-y", "@coreyuan/vector-mind"]`
+
+通常情况下客户端会通过 MCP `roots/list` 自动提供 workspace root，因此无需写死目录，配置如下：
+```json
+{
+  "command": "npx",
+  "args": ["-y", "@coreyuan/vector-mind"]
+}
+```
+
+如果你发现 `.vectormind.db` 落在了错误目录（或你的 MCP Client 不支持 `roots/list`），再加上：
+```json
+{
+  "command": "npx",
+  "args": ["-y", "@coreyuan/vector-mind"],
+  "env": { "VECTORMIND_ROOT": "H:\\\\path\\\\to\\\\your-project" }
+}
+```
 
 配置完成后，客户端会在初始化阶段拿到该服务器的 tools + instructions；AI 就能“知道它存在”，并在需要时调用，而不是盲猜。
 
@@ -87,10 +161,27 @@ npx -y @your-org/vector-mind
 AI：调用 `start_requirement("用户头像上传功能", "支持 PNG/JPG")`。  
 你/AI：改完 `upload.ts` 和 `user.model.ts` 并保存。  
 AI：调用 `sync_change_intent("增加 Multer 配置，并在 user model 增加 avatar 字段", ["upload.ts","user.model.ts"])`。  
-下次新会话：AI 先 `get_brain_dump()`，直接告诉你当前进度与下一步。
+AI：在对话里写一段阶段总结后，调用 `upsert_project_summary("...")`。  
+下次新会话：AI 先 `get_brain_dump()`，再用 `semantic_search("头像上传下一步是什么？")` 快速定位相关上下文与代码位置。
 
 ## 注意事项
 
 - `sync_change_intent` 只会关联到“最近的 active 需求”；如需并行多需求，建议先把一个需求标记完成（当前版本未提供 completion tool）。
 - 符号索引是启发式的，复杂语法/宏/生成代码可能不完整；如需更高精度，可扩展为 AST/语言服务器方案。
 
+使用方式
+
+你可以直接发这句来测试（推荐新会话第一句就这么发）：
+```
+请先调用 vector-mind 的 bootstrap_context({ query: "我现在要做什么？" })，把返回的 JSON 原样贴出来，然后再继续回答。
+```
+怎么确认它真的调用了：
+
+对话里会出现一次 tool 调用记录/卡片（不同客户端 UI 不一样）
+或者你让它把 bootstrap_context 返回的 JSON 原样输出（里面会有 ok: true；新版还会带 project_root/db_path 用来确认落库位置）
+
+如果你希望“每次都自动调用”，就在你的固定/system 指令里加一句：
+
+```
+每次新会话开始先调用 bootstrap_context，再开始分析/改代码。
+```
