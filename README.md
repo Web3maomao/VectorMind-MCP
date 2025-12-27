@@ -72,7 +72,7 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 
 ## 本地数据与监听
 
-- 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind.db`（默认已在 `.gitignore` 中忽略）
+- 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind/vectormind.db`（默认已在 `.gitignore` 中忽略整个 `.vectormind/` 目录）
 - 监听范围：默认监听 workspace root（同上）下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
 - 语义向量：默认使用本地 embedding 模型（`@xenova/transformers`），首次运行可能需要下载模型权重（无云端 API 调用，向量与数据都保存在本地）
@@ -144,7 +144,7 @@ npx -y @coreyuan/vector-mind
 }
 ```
 
-如果你发现 `.vectormind.db` 落在了错误目录（或你的 MCP Client 不支持 `roots/list`），再加上：
+如果你发现 `.vectormind/vectormind.db` 落在了错误目录（或你的 MCP Client 不支持 `roots/list`），再加上：
 ```json
 {
   "command": "npx",
@@ -154,6 +154,10 @@ npx -y @coreyuan/vector-mind
 ```
 
 配置完成后，客户端会在初始化阶段拿到该服务器的 tools + instructions；AI 就能“知道它存在”，并在需要时调用，而不是盲猜。
+
+## Claude Skills（Claude Code / myclaude）
+
+如果你使用的是 Claude Code（或类似 myclaude 的 skills 机制），把仓库里的 `skills/vector-mind` 复制到你的 `~/.claude/skills/vector-mind`（Windows: `C:\Users\<you>\.claude\skills\vector-mind`），重启后就会被识别为一个 Skill。
 
 ## 典型示例
 

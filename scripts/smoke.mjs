@@ -82,6 +82,16 @@ async function main() {
     if (parsed?.root_source !== "mcp_roots") {
       throw new Error(`expected root_source=mcp_roots, got ${parsed?.root_source}`);
     }
+    const expectedDbPath = path.join(runDir, ".vectormind", "vectormind.db");
+    if (!parsed?.db_path) {
+      throw new Error("expected db_path in bootstrap_context output");
+    }
+    if (path.resolve(parsed.db_path) !== path.resolve(expectedDbPath)) {
+      throw new Error(`expected db_path=${expectedDbPath}, got ${parsed.db_path}`);
+    }
+    if (!fs.existsSync(expectedDbPath)) {
+      throw new Error(`expected db file to exist at ${expectedDbPath}`);
+    }
   } catch (err) {
     console.error("\n[smoke] root resolution check failed:", err);
     process.exitCode = 1;

@@ -1,4 +1,5 @@
 # VectorMind runtime artifacts
+.vectormind/
 .vectormind.db
 .vectormind.db-wal
 .vectormind.db-shm

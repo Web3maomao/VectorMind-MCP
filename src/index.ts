@@ -62,7 +62,7 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.1";
+const SERVER_VERSION = "1.0.2";
 
 type RootSource = "env" | "mcp_roots" | "cwd";
 
@@ -144,6 +144,12 @@ function shouldIgnorePath(inputPath: string): boolean {
   if (rel.startsWith("..") || path.isAbsolute(rel)) return true;
 
   const relPosix = rel.replace(/\\/g, "/");
+  const top = relPosix.split("/")[0];
+  if (top === "node_modules" || top === ".git" || top === "dist" || top === ".vectormind") {
+    return true;
+  }
+
+  // Backward-compat ignore (pre-1.0.2 stored the DB in repo root)
   if (
     relPosix === ".vectormind.db" ||
     relPosix.startsWith(".vectormind.db-") ||
@@ -151,9 +157,6 @@ function shouldIgnorePath(inputPath: string): boolean {
   ) {
     return true;
   }
-
-  const top = relPosix.split("/")[0];
-  if (top === "node_modules" || top === ".git" || top === "dist") return true;
 
   return false;
 }
@@ -932,7 +935,44 @@ async function resolveProjectRoot(): Promise<{ root: string; source: RootSource 
 }
 
 function initDatabase(): void {
-  dbPath = path.join(projectRoot, ".vectormind.db");
+  const vmDir = path.join(projectRoot, ".vectormind");
+  try {
+    fs.mkdirSync(vmDir, { recursive: true });
+  } catch {
+    // ignore
+  }
+
+  const legacyDbPath = path.join(projectRoot, ".vectormind.db");
+  const nextDbPath = path.join(vmDir, "vectormind.db");
+  dbPath = nextDbPath;
+
+  // One-time migration: move legacy root DB into .vectormind/ if the new DB doesn't exist yet.
+  if (!fs.existsSync(nextDbPath) && fs.existsSync(legacyDbPath)) {
+    const legacyWal = `${legacyDbPath}-wal`;
+    const legacyShm = `${legacyDbPath}-shm`;
+    const legacyJournal = `${legacyDbPath}-journal`;
+    const nextWal = `${nextDbPath}-wal`;
+    const nextShm = `${nextDbPath}-shm`;
+    const nextJournal = `${nextDbPath}-journal`;
+
+    try {
+      fs.renameSync(legacyDbPath, nextDbPath);
+      try {
+        if (fs.existsSync(legacyWal) && !fs.existsSync(nextWal)) fs.renameSync(legacyWal, nextWal);
+      } catch {}
+      try {
+        if (fs.existsSync(legacyShm) && !fs.existsSync(nextShm)) fs.renameSync(legacyShm, nextShm);
+      } catch {}
+      try {
+        if (fs.existsSync(legacyJournal) && !fs.existsSync(nextJournal)) {
+          fs.renameSync(legacyJournal, nextJournal);
+        }
+      } catch {}
+    } catch {
+      // If migration fails, fall back to opening the legacy DB in-place.
+      dbPath = legacyDbPath;
+    }
+  }
   db = new Database(dbPath);
 
   db.pragma("journal_mode = WAL");
@@ -1183,7 +1223,6 @@ async function initializeIfNeeded(): Promise<void> {
   projectRoot = resolved.root;
   rootSource = resolved.source;
 
-  const localDbPath = path.join(projectRoot, ".vectormind.db");
   try {
     fs.mkdirSync(projectRoot, { recursive: true });
   } catch {
@@ -1191,7 +1230,6 @@ async function initializeIfNeeded(): Promise<void> {
   }
 
   try {
-    dbPath = localDbPath;
     initDatabase();
     initWatcher();
     initialized = true;
