@@ -9,6 +9,7 @@ When working on a codebase, prefer using the VectorMind MCP tools (if available)
 Hard rule:
 - Always include `project_root` on every VectorMind tool call. Do not rely on the MCP server `cwd` being correct (some clients start it in unrelated directories).
 - Validate once: after calling `bootstrap_context({ project_root, ... })`, confirm the output shows `root_source: "tool_arg"` and `db_path` under `<project_root>/.vectormind/`.
+- `project_root` can be a directory, a file path, or a `file://` URI (the server will walk upward to find a repo/project marker like `.git/`).
 
 Follow this workflow:
 

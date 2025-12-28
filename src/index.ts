@@ -62,7 +62,7 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.7";
+const SERVER_VERSION = "1.0.8";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -188,6 +188,60 @@ function parseFileUriToPath(uri: string): string | null {
   }
 }
 
+function isProjectRootMarkerPresent(dir: string): boolean {
+  const markers = [
+    ".git",
+    ".hg",
+    ".svn",
+    "package.json",
+    "pnpm-workspace.yaml",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "package-lock.json",
+    "tsconfig.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "Pipfile",
+    "poetry.lock",
+    "go.mod",
+    "Cargo.toml",
+    "Cargo.lock",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+  ];
+
+  for (const m of markers) {
+    try {
+      if (fs.existsSync(path.join(dir, m))) return true;
+    } catch {
+      // ignore
+    }
+  }
+
+  // Visual Studio solutions: check for any *.sln at this level.
+  try {
+    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (ent.isFile() && ent.name.toLowerCase().endsWith(".sln")) return true;
+    }
+  } catch {
+    // ignore
+  }
+
+  return false;
+}
+
+function findNearestProjectRoot(startDir: string): string {
+  let dir = path.resolve(startDir);
+  for (let i = 0; i < 50; i++) {
+    if (isProjectRootMarkerPresent(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return path.resolve(startDir);
+}
+
 function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; source: RootSource } | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
@@ -195,13 +249,31 @@ function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; source: Ro
 
   const uriPath = trimmed.startsWith("file:") ? parseFileUriToPath(trimmed) : null;
   const abs = path.resolve(uriPath ?? trimmed);
+  const parent = path.dirname(abs);
+  let startDir: string;
   try {
     const st = fs.statSync(abs);
+    startDir = st.isDirectory() ? abs : parent;
+  } catch {
+    // If the user provided a file path that doesn't exist yet, accept its parent directory.
+    try {
+      const st2 = fs.statSync(parent);
+      if (!st2.isDirectory()) throw new Error("parent is not a directory");
+      startDir = parent;
+    } catch (err) {
+      throw new Error(`[VectorMind] Invalid project_root: ${abs}. (${String(err)})`);
+    }
+  }
+
+  const root = findNearestProjectRoot(startDir);
+  try {
+    const st = fs.statSync(root);
     if (!st.isDirectory()) throw new Error("not a directory");
   } catch (err) {
-    throw new Error(`[VectorMind] Invalid project_root: ${abs}. (${String(err)})`);
+    throw new Error(`[VectorMind] Invalid project_root: ${root}. (${String(err)})`);
   }
-  return { root: abs, source: "tool_arg" };
+
+  return { root, source: "tool_arg" };
 }
 
 function resolveRootFromEnvOrThrow(): { root: string; source: RootSource } | null {
@@ -1187,6 +1259,7 @@ const server = new Server(
     instructions: [
       "VectorMind MCP is available in this session. Use it to avoid guessing project context.",
       "Project root resolution order: tool argument project_root (recommended for clients without roots/list), then VECTORMIND_ROOT (avoid hardcoding in global config), then MCP roots/list (best-effort; falls back quickly if unsupported), then process.cwd() (so start your MCP client in the project directory for per-project isolation).",
+      "If root_source is fallback, file watching/indexing is disabled (pass project_root to enable per-project tracking).",
       "",
       "Required workflow:",
       "- On every new conversation/session: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
@@ -1572,21 +1645,22 @@ function initWatcher(): void {
   watcherReady = false;
   watcher = chokidar.watch(projectRoot, {
     ignored: (p) => shouldIgnorePath(p),
-    ignoreInitial: false,
+    // Avoid indexing the entire tree on startup; track changes after the server is running.
+    ignoreInitial: true,
     persistent: true,
     awaitWriteFinish: { stabilityThreshold: 200, pollInterval: 50 },
   });
 
   watcher.on("add", (p: string) => {
-    if (watcherReady) recordPendingChange(p, "add");
+    recordPendingChange(p, "add");
     indexFile(p, "add");
   });
   watcher.on("change", (p: string) => {
-    if (watcherReady) recordPendingChange(p, "change");
+    recordPendingChange(p, "change");
     indexFile(p, "change");
   });
   watcher.on("unlink", (p: string) => {
-    if (watcherReady) recordPendingChange(p, "unlink");
+    recordPendingChange(p, "unlink");
     removeFileIndexes(p);
   });
   watcher.on("ready", () => {
@@ -1609,9 +1683,18 @@ async function initializeIfNeeded(forced?: { root: string; source: RootSource })
 
   try {
     initDatabase();
-    initWatcher();
+    if (rootSource === "fallback") {
+      // If we can't confidently determine the project root (e.g. Codex VS Code started us in System32),
+      // don't watch/index the fallback directory. Callers should pass `project_root`.
+      watcher = null;
+      watcherReady = false;
+    } else {
+      initWatcher();
+    }
     initialized = true;
-    console.error(`[vectormind] project_root=${projectRoot} source=${rootSource} db=${dbPath}`);
+    console.error(
+      `[vectormind] project_root=${projectRoot} source=${rootSource} db=${dbPath} watcher=${watcher ? "on" : "off"}`,
+    );
   } catch (err) {
     try {
       watcher?.close().catch(() => {});
@@ -1961,13 +2044,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               {
                 ok: true,
                 generated_at: new Date().toISOString(),
-                project_root: projectRoot,
-                root_source: rootSource,
-                db_path: dbPath,
-                watcher_ready: watcherReady,
-                embeddings: {
-                  enabled: embeddingsEnabled,
-                  model: embedModelName,
+                 project_root: projectRoot,
+                 root_source: rootSource,
+                 db_path: dbPath,
+                 watcher_enabled: !!watcher,
+                 watcher_ready: watcherReady,
+                 embeddings: {
+                   enabled: embeddingsEnabled,
+                   model: embedModelName,
                   embed_files: embedFilesMode,
                 },
                 project_summary: project_summary ?? null,
@@ -2006,13 +2090,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               {
                 ok: true,
                 generated_at: new Date().toISOString(),
-                project_root: projectRoot,
-                root_source: rootSource,
-                db_path: dbPath,
-                watcher_ready: watcherReady,
-                embeddings: {
-                  enabled: embeddingsEnabled,
-                  model: embedModelName,
+                 project_root: projectRoot,
+                 root_source: rootSource,
+                 db_path: dbPath,
+                 watcher_enabled: !!watcher,
+                 watcher_ready: watcherReady,
+                 embeddings: {
+                   enabled: embeddingsEnabled,
+                   model: embedModelName,
                   embed_files: embedFilesMode,
                 },
                 project_summary: project_summary ?? null,

@@ -33,6 +33,9 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 
 ## MCP Tools
 
+> 提示：所有 tools 都支持可选参数 `project_root?: string`。当你的 MCP Client 无法提供正确的 workspace root（例如 Codex VS Code 插件 cwd/roots 不可靠）时，**务必显式传入**。  
+> `project_root` 既可以是目录，也可以是某个文件路径/`file://` URI（服务端会向上查找 `.git/`、`package.json`、`pyproject.toml` 等标记来推断项目根目录）。
+
 ### `start_requirement`
 - 入参：`{ title: string, background?: string }`
 - 用途：创建并激活一个需求（后续改动意图会自动关联到最新 `active` 需求）
@@ -76,6 +79,8 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 - 监听范围：默认监听 workspace root（同上）下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
 - 检索：默认使用本地 SQLite FTS（无需模型）；当你设置 `VECTORMIND_EMBEDDINGS=on` 才会启用向量化（`@xenova/transformers`），并优先用向量相似度做语义召回（首次启用可能下载模型权重，向量与数据都在本地）
+
+> 注意：当 `root_source` 为 `fallback`（例如被 VS Code/Codex 在 `C:\Windows\System32` 启动，且 client 不支持 `roots/list`）时，为避免错误目录被大量扫描，VectorMind 会 **禁用文件监听/索引**（`watcher_enabled=false`）。此时请使用 `project_root` 绑定到正确项目。
 
 ## 检索/向量化配置（可选）
 
@@ -186,8 +191,10 @@ args = ["-y", "@coreyuan/vector-mind"]
 
 ### Codex Skills（OpenAI Codex）
 
-- 安装：把 `skills/vector-mind-autopilot` 复制到 `~/.codex/skills/vector-mind-autopilot`（Windows: `C:\Users\<you>\.codex\skills\vector-mind-autopilot`），或直接使用打包文件 `skill-dist/vector-mind-autopilot.skill`
-- 使用：重启后正常聊天即可；如未触发，可在对话里提一次 `$vector-mind-autopilot`
+- 安装：把 `skills/vector-mind-autopilot` 复制到 `~/.codex/skills/vector-mind-autopilot`（Windows: `C:\Users\<you>\.codex\skills\vector-mind-autopilot`）
+  - `skill-dist/vector-mind-autopilot.skill` 只是一个 zip 包；Codex 不会“放进去就识别”，需要解压到上面的目录结构里才会生效。
+- 使用：**重启 Codex（或重启 VS Code）并开启一个新会话/新 Agent** 后正常聊天即可；如未触发，可在对话里提一次 `$vector-mind-autopilot`
+  - 验证是否加载：新会话开头的 `## Skills` 列表里应包含 `vector-mind-autopilot`；如果你一直在同一个会话里对话，更新 skill 不会热加载。
 
 ### Claude Skills（Claude Code / myclaude）
 
@@ -222,10 +229,16 @@ AI：在对话里写一段阶段总结后，调用 `upsert_project_summary("..."
 怎么确认它真的调用了：
 
 对话里会出现一次 tool 调用记录/卡片（不同客户端 UI 不一样）
-或者你让它把 bootstrap_context 返回的 JSON 原样输出（里面会有 ok: true；新版还会带 project_root/db_path 用来确认落库位置）
+或者你让它把 bootstrap_context 返回的 JSON 原样输出（里面会有 ok: true；新版还会带 project_root/root_source/watcher_enabled/db_path 用来确认落库与监听是否在正确项目）
 
 如果你希望“每次都自动调用”，就在你的固定/system 指令里加一句：
 
 ```
 每次新会话开始先调用 bootstrap_context，再开始分析/改代码。
+```
+
+如果在项目根目录中没有生成.vectormind文件夹，需要手动发送以下命令给AI来绑定目录
+
+```
+每次调用 VectorMind 工具时，要主动把 project_root 参数传进去
 ```

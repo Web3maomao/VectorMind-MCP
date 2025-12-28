@@ -74,6 +74,12 @@ If you still cannot determine it confidently, ask the user for the project root 
 
 ## Setup / Troubleshooting
 
+### Skill changes not taking effect
+
+- Skills are discovered at **Codex startup**; they are not hot-reloaded per message.
+- After installing/updating this skill, **restart Codex** (and in VS Code, fully restart the editor) and start a **new chat/Agent**.
+- Quick verification: the new session’s `## Skills` list should include `vector-mind-autopilot`. If it doesn’t, Codex isn’t loading it yet.
+
 ### Don’t hardcode a single project in global config
 
 - If you set `[mcp_servers.vector-mind].cwd` or `env.VECTORMIND_ROOT` inside the **global** `~/.codex/config.toml`, VectorMind will be locked to that one directory and will NOT create `<project>/.vectormind/` for other projects.
