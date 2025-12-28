@@ -62,9 +62,9 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.4";
+const SERVER_VERSION = "1.0.7";
 
-type RootSource = "env" | "mcp_roots" | "cwd" | "fallback";
+type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
 const rootFromEnv = process.env.VECTORMIND_ROOT?.trim() ?? "";
 
@@ -73,6 +73,14 @@ const ROOTS_LIST_TIMEOUT_MS = (() => {
   if (!raw) return 750;
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n <= 0) return 750;
+  return n;
+})();
+
+const BOOTSTRAP_SEMANTIC_TIMEOUT_MS = (() => {
+  const raw = process.env.VECTORMIND_SEMANTIC_TIMEOUT_MS?.trim();
+  if (!raw) return 2500;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 2500;
   return n;
 })();
 
@@ -111,9 +119,38 @@ let indexFileSymbolsTx:
   | ((filePath: string, symbols: ExtractedSymbol[]) => void)
   | null = null;
 
+const FTS_TABLE_NAME = "memory_items_fts";
+let ftsAvailable = false;
+
 function isProbablyVscodeInstallDir(dir: string): boolean {
   const lower = dir.replace(/\\/g, "/").toLowerCase();
   return lower.includes("/microsoft vs code");
+}
+
+function isProbablySystemDir(dir: string): boolean {
+  if (process.platform !== "win32") return false;
+  const candidate = path.resolve(dir);
+  const sysRootRaw = process.env.SystemRoot?.trim();
+  const sysRoot = sysRootRaw ? path.resolve(sysRootRaw) : null;
+  if (sysRoot) {
+    const rel = path.relative(sysRoot, candidate);
+    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+  }
+  const windowsFallback = path.resolve("C:\\Windows");
+  {
+    const rel = path.relative(windowsFallback, candidate);
+    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+  }
+  const programFiles = [
+    process.env["ProgramFiles"],
+    process.env["ProgramFiles(x86)"],
+    process.env["ProgramW6432"],
+  ].filter(Boolean) as string[];
+  for (const pf of programFiles) {
+    const rel = path.relative(path.resolve(pf), candidate);
+    if (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return true;
+  }
+  return false;
 }
 
 function getVsCodeUserDirCandidate(): string | null {
@@ -149,6 +186,22 @@ function parseFileUriToPath(uri: string): string | null {
   } catch {
     return null;
   }
+}
+
+function resolveRootFromToolArgOrThrow(raw: unknown): { root: string; source: RootSource } | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const uriPath = trimmed.startsWith("file:") ? parseFileUriToPath(trimmed) : null;
+  const abs = path.resolve(uriPath ?? trimmed);
+  try {
+    const st = fs.statSync(abs);
+    if (!st.isDirectory()) throw new Error("not a directory");
+  } catch (err) {
+    throw new Error(`[VectorMind] Invalid project_root: ${abs}. (${String(err)})`);
+  }
+  return { root: abs, source: "tool_arg" };
 }
 
 function resolveRootFromEnvOrThrow(): { root: string; source: RootSource } | null {
@@ -591,49 +644,64 @@ function removeFileIndexes(absPath: string): void {
   }
 }
 
-const StartRequirementArgsSchema = z.object({
-  title: z.string().min(1),
-  background: z.string().optional().default(""),
+const ProjectRootArgSchema = z.object({
+  project_root: z.string().optional(),
 });
 
-const SyncChangeIntentArgsSchema = z
-  .object({
+const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    title: z.string().min(1),
+    background: z.string().optional().default(""),
+  }),
+);
+
+const SyncChangeIntentArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
     intent: z.string().min(1),
     files: z.array(z.string().min(1)).optional(),
     affected_files: z.array(z.string().min(1)).optional(),
-  })
-  .transform((v) => ({
-    intent: v.intent,
-    files: (v.files ?? v.affected_files ?? []).filter(Boolean),
-  }));
+  }),
+);
 
-const QueryCodebaseArgsSchema = z.object({
-  query: z.string().min(1),
-});
+const QueryCodebaseArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    query: z.string().min(1),
+  }),
+);
 
-const UpsertProjectSummaryArgsSchema = z.object({
-  summary: z.string().min(1),
-});
+const UpsertProjectSummaryArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    summary: z.string().min(1),
+  }),
+);
 
-const AddNoteArgsSchema = z.object({
-  title: z.string().optional().default(""),
-  content: z.string().min(1),
-  tags: z.array(z.string().min(1)).optional(),
-});
+const AddNoteArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    title: z.string().optional().default(""),
+    content: z.string().min(1),
+    tags: z.array(z.string().min(1)).optional(),
+  }),
+);
 
-const BootstrapContextArgsSchema = z.object({
-  query: z.string().optional(),
-  top_k: z.number().int().min(1).max(50).optional().default(10),
-  kinds: z.array(z.string().min(1)).optional(),
-  include_content: z.boolean().optional().default(false),
-});
+const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    query: z.string().optional(),
+    top_k: z.number().int().min(1).max(50).optional().default(10),
+    kinds: z.array(z.string().min(1)).optional(),
+    include_content: z.boolean().optional().default(false),
+  }),
+);
 
-const SemanticSearchArgsSchema = z.object({
-  query: z.string().min(1),
-  top_k: z.number().int().min(1).max(50).optional().default(10),
-  kinds: z.array(z.string().min(1)).optional(),
-  include_content: z.boolean().optional().default(false),
-});
+const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    query: z.string().min(1),
+    top_k: z.number().int().min(1).max(50).optional().default(10),
+    kinds: z.array(z.string().min(1)).optional(),
+    include_content: z.boolean().optional().default(false),
+  }),
+);
+
+const ProjectRootOnlyArgsSchema = ProjectRootArgSchema;
 
 function escapeLike(pattern: string): string {
   return pattern.replace(/[\\\\%_]/g, (m) => `\\${m}`);
@@ -653,7 +721,7 @@ function safeJson(value: unknown): string | null {
 }
 
 const embeddingsEnabled = !["0", "false", "off", "disabled"].includes(
-  (process.env.VECTORMIND_EMBEDDINGS ?? "on").toLowerCase(),
+  (process.env.VECTORMIND_EMBEDDINGS ?? "off").toLowerCase(),
 );
 const embedFilesMode = (process.env.VECTORMIND_EMBED_FILES ?? "all").toLowerCase();
 const embedModelName = process.env.VECTORMIND_EMBED_MODEL ?? "Xenova/all-MiniLM-L6-v2";
@@ -798,36 +866,90 @@ function dotProduct(a: Float32Array, b: Float32Array): number {
   return s;
 }
 
-async function semanticSearchInternal(opts: {
+type SemanticSearchMode = "embeddings" | "fts" | "like";
+
+type MemoryItemSearchRow = Pick<
+  MemoryItemRow,
+  | "id"
+  | "kind"
+  | "title"
+  | "content"
+  | "file_path"
+  | "start_line"
+  | "end_line"
+  | "req_id"
+  | "metadata_json"
+  | "updated_at"
+>;
+
+type SemanticSearchMatch = {
+  score: number;
+  item: {
+    id: number;
+    kind: string;
+    title: string | null;
+    file_path: string | null;
+    start_line: number | null;
+    end_line: number | null;
+    req_id: number | null;
+    preview: string;
+    content?: string;
+    metadata_json: string | null;
+    updated_at: string;
+  };
+};
+
+type SemanticSearchResult = {
+  query: string;
+  top_k: number;
+  mode: SemanticSearchMode;
+  matches: SemanticSearchMatch[];
+};
+
+type SemanticSearchOpts = {
   query: string;
   topK: number;
   kinds: string[] | null;
   includeContent: boolean;
-}): Promise<{
-  query: string;
-  top_k: number;
-  matches: Array<{
-    score: number;
+};
+
+function makePreviewText(content: string): string {
+  const max = 400;
+  if (content.length <= max) return content;
+  return `${content.slice(0, max)}...`;
+}
+
+function toSemanticMatch(
+  row: MemoryItemSearchRow,
+  score: number,
+  includeContent: boolean,
+): SemanticSearchMatch {
+  const preview = makePreviewText(row.content);
+  return {
+    score,
     item: {
-      id: number;
-      kind: string;
-      title: string | null;
-      file_path: string | null;
-      start_line: number | null;
-      end_line: number | null;
-      req_id: number | null;
-      preview: string;
-      content?: string;
-      metadata_json: string | null;
-      updated_at: string;
-    };
-  }>;
-}> {
+      id: row.id,
+      kind: row.kind,
+      title: row.title,
+      file_path: row.file_path,
+      start_line: row.start_line,
+      end_line: row.end_line,
+      req_id: row.req_id,
+      preview,
+      content: includeContent ? row.content : undefined,
+      metadata_json: row.metadata_json,
+      updated_at: row.updated_at,
+    },
+  };
+}
+
+async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
   if (!embeddingsEnabled) {
     throw new Error("Embeddings are disabled");
   }
 
   const q = opts.query.trim();
+  if (!q) return { query: "", top_k: opts.topK, mode: "embeddings", matches: [] };
   const embedder = await getEmbedder();
   const qVec = await embedder(q);
 
@@ -873,23 +995,7 @@ async function semanticSearchInternal(opts: {
     .map((t) => {
       const item = getMemoryItemByIdStmt.get(t.memory_id) as MemoryItemRow | undefined;
       if (!item) return null;
-      const preview = item.content.length > 400 ? `${item.content.slice(0, 400)}…` : item.content;
-      return {
-        score: t.score,
-        item: {
-          id: item.id,
-          kind: item.kind,
-          title: item.title,
-          file_path: item.file_path,
-          start_line: item.start_line,
-          end_line: item.end_line,
-          req_id: item.req_id,
-          preview,
-          content: opts.includeContent ? item.content : undefined,
-          metadata_json: item.metadata_json,
-          updated_at: item.updated_at,
-        },
-      };
+      return toSemanticMatch(item, t.score, opts.includeContent);
     })
     .filter(Boolean) as Array<{
     score: number;
@@ -908,7 +1014,170 @@ async function semanticSearchInternal(opts: {
     };
   }>;
 
-  return { query: q, top_k: opts.topK, matches };
+  return { query: q, top_k: opts.topK, mode: "embeddings", matches };
+}
+
+function buildFtsMatchQuery(raw: string): string {
+  const terms = raw
+    .trim()
+    .split(/\s+/)
+    .map((t) => t.trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  if (!terms.length) return '""';
+  return terms.map((t) => `"${t.replaceAll('"', '""')}"`).join(" AND ");
+}
+
+function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
+  if (!ftsAvailable) {
+    throw new Error("FTS is unavailable");
+  }
+
+  const q = opts.query.trim();
+  if (!q) return { query: "", top_k: opts.topK, mode: "fts", matches: [] };
+  const matchQuery = buildFtsMatchQuery(q);
+
+  const rows: Array<FtsSearchRow> = (() => {
+    if (opts.kinds?.length) {
+      const placeholders = opts.kinds.map(() => "?").join(", ");
+      const stmt = db.prepare(`
+        SELECT
+          m.id as id,
+          m.kind as kind,
+          m.title as title,
+          m.content as content,
+          m.file_path as file_path,
+          m.start_line as start_line,
+          m.end_line as end_line,
+          m.req_id as req_id,
+          m.metadata_json as metadata_json,
+          m.updated_at as updated_at,
+          bm25(${FTS_TABLE_NAME}) as rank
+        FROM ${FTS_TABLE_NAME}
+        JOIN memory_items m ON m.id = ${FTS_TABLE_NAME}.rowid
+        WHERE ${FTS_TABLE_NAME} MATCH ?
+          AND m.kind IN (${placeholders})
+        ORDER BY rank ASC
+        LIMIT ?
+      `);
+      return stmt.all(matchQuery, ...opts.kinds, opts.topK) as Array<FtsSearchRow>;
+    }
+
+    const stmt = db.prepare(`
+      SELECT
+        m.id as id,
+        m.kind as kind,
+        m.title as title,
+        m.content as content,
+        m.file_path as file_path,
+        m.start_line as start_line,
+        m.end_line as end_line,
+        m.req_id as req_id,
+        m.metadata_json as metadata_json,
+        m.updated_at as updated_at,
+        bm25(${FTS_TABLE_NAME}) as rank
+      FROM ${FTS_TABLE_NAME}
+      JOIN memory_items m ON m.id = ${FTS_TABLE_NAME}.rowid
+      WHERE ${FTS_TABLE_NAME} MATCH ?
+      ORDER BY rank ASC
+      LIMIT ?
+    `);
+    return stmt.all(matchQuery, opts.topK) as Array<FtsSearchRow>;
+  })();
+
+  const matches = rows.map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent));
+  return { query: q, top_k: opts.topK, mode: "fts", matches };
+}
+
+type FtsSearchRow = MemoryItemSearchRow & { rank: number };
+type LikeSearchRow = MemoryItemSearchRow & { score: number };
+
+function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
+  const q = opts.query.trim();
+  if (!q) return { query: "", top_k: opts.topK, mode: "like", matches: [] };
+  const escaped = escapeLike(q);
+  const like = `%${escaped}%`;
+
+  const rows: Array<LikeSearchRow> = (() => {
+    if (opts.kinds?.length) {
+      const placeholders = opts.kinds.map(() => "?").join(", ");
+      const stmt = db.prepare(`
+        SELECT
+          id,
+          kind,
+          title,
+          content,
+          file_path,
+          start_line,
+          end_line,
+          req_id,
+          metadata_json,
+          updated_at,
+          CASE
+            WHEN title LIKE ? ESCAPE '\\' THEN 3
+            WHEN file_path LIKE ? ESCAPE '\\' THEN 2
+            ELSE 1
+          END AS score
+        FROM memory_items
+        WHERE (content LIKE ? ESCAPE '\\'
+            OR title LIKE ? ESCAPE '\\'
+            OR file_path LIKE ? ESCAPE '\\')
+          AND kind IN (${placeholders})
+        ORDER BY score DESC, updated_at DESC, id DESC
+        LIMIT ?
+      `);
+      return stmt.all(like, like, like, like, like, ...opts.kinds, opts.topK) as Array<LikeSearchRow>;
+    }
+
+    const stmt = db.prepare(`
+      SELECT
+        id,
+        kind,
+        title,
+        content,
+        file_path,
+        start_line,
+        end_line,
+        req_id,
+        metadata_json,
+        updated_at,
+        CASE
+          WHEN title LIKE ? ESCAPE '\\' THEN 3
+          WHEN file_path LIKE ? ESCAPE '\\' THEN 2
+          ELSE 1
+        END AS score
+      FROM memory_items
+      WHERE (content LIKE ? ESCAPE '\\'
+          OR title LIKE ? ESCAPE '\\'
+          OR file_path LIKE ? ESCAPE '\\')
+      ORDER BY score DESC, updated_at DESC, id DESC
+      LIMIT ?
+    `);
+    return stmt.all(like, like, like, like, like, opts.topK) as Array<LikeSearchRow>;
+  })();
+
+  const matches = rows.map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent));
+  return { query: q, top_k: opts.topK, mode: "like", matches };
+}
+
+async function semanticSearchHybridInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
+  if (embeddingsEnabled) {
+    try {
+      return await semanticSearchInternal(opts);
+    } catch (err) {
+      console.error("[vectormind] embeddings semantic_search failed; falling back:", err);
+    }
+  }
+
+  if (ftsAvailable) {
+    try {
+      return ftsSearchInternal(opts);
+    } catch (err) {
+      console.error("[vectormind] fts semantic_search failed; falling back:", err);
+    }
+  }
+
+  return likeSearchInternal(opts);
 }
 
 const server = new Server(
@@ -917,10 +1186,10 @@ const server = new Server(
     capabilities: { tools: {} },
     instructions: [
       "VectorMind MCP is available in this session. Use it to avoid guessing project context.",
-      "Project root is resolved from VECTORMIND_ROOT (override; avoid hardcoding in global config), else MCP roots/list (best-effort; falls back quickly if unsupported), else process.cwd() (so start your MCP client in the project directory for per-project isolation).",
+      "Project root resolution order: tool argument project_root (recommended for clients without roots/list), then VECTORMIND_ROOT (avoid hardcoding in global config), then MCP roots/list (best-effort; falls back quickly if unsupported), then process.cwd() (so start your MCP client in the project directory for per-project isolation).",
       "",
       "Required workflow:",
-      "- On every new conversation/session: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local vector store.",
+      "- On every new conversation/session: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
       "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
       "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
       "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
@@ -962,10 +1231,83 @@ async function resolveProjectRoot(): Promise<{ root: string; source: RootSource 
   if (rootFromMcp) return { root: rootFromMcp, source: "mcp_roots" };
 
   const cwd = process.cwd();
-  if (isProbablyVscodeInstallDir(cwd)) {
+  if (isProbablyVscodeInstallDir(cwd) || isProbablySystemDir(cwd)) {
     return { root: resolveSafeFallbackRootDir(), source: "fallback" };
   }
   return { root: cwd, source: "cwd" };
+}
+
+function initMemoryItemsFts(): void {
+  ftsAvailable = false;
+
+  try {
+    const existed = db
+      .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name=?`)
+      .get(FTS_TABLE_NAME);
+    const alreadyExists = !!existed;
+
+    if (!alreadyExists) {
+      try {
+        db.exec(`
+          CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
+            kind,
+            title,
+            content,
+            file_path,
+            metadata_json,
+            content='memory_items',
+            content_rowid='id',
+            tokenize='trigram'
+          );
+        `);
+      } catch {
+        db.exec(`
+          CREATE VIRTUAL TABLE ${FTS_TABLE_NAME} USING fts5(
+            kind,
+            title,
+            content,
+            file_path,
+            metadata_json,
+            content='memory_items',
+            content_rowid='id'
+          );
+        `);
+      }
+
+      try {
+        db.exec(`INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}) VALUES('rebuild');`);
+      } catch (err) {
+        console.error("[vectormind] fts rebuild failed:", err);
+      }
+    }
+
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ai
+      AFTER INSERT ON memory_items BEGIN
+        INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
+        VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_ad
+      AFTER DELETE ON memory_items BEGIN
+        INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
+        VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS vectormind_memory_items_fts_au
+      AFTER UPDATE ON memory_items BEGIN
+        INSERT INTO ${FTS_TABLE_NAME}(${FTS_TABLE_NAME}, rowid, kind, title, content, file_path, metadata_json)
+        VALUES ('delete', old.id, old.kind, old.title, old.content, old.file_path, old.metadata_json);
+        INSERT INTO ${FTS_TABLE_NAME}(rowid, kind, title, content, file_path, metadata_json)
+        VALUES (new.id, new.kind, new.title, new.content, new.file_path, new.metadata_json);
+      END;
+    `);
+
+    db.prepare(`SELECT rowid FROM ${FTS_TABLE_NAME} LIMIT 1`).get();
+    ftsAvailable = true;
+  } catch (err) {
+    ftsAvailable = false;
+  }
 }
 
 function initDatabase(): void {
@@ -1095,6 +1437,8 @@ function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_pending_changes_updated_at
       ON pending_changes(updated_at DESC);
   `);
+
+  initMemoryItemsFts();
 
   insertRequirementStmt = db.prepare(
     `INSERT INTO requirements (title, context_data, status) VALUES (?, ?, 'active')`,
@@ -1251,9 +1595,9 @@ function initWatcher(): void {
   watcher.on("error", (err: unknown) => console.error("[vectormind] watcher error:", err));
 }
 
-async function initializeIfNeeded(): Promise<void> {
+async function initializeIfNeeded(forced?: { root: string; source: RootSource }): Promise<void> {
   if (initialized) return;
-  const resolved = await resolveProjectRoot();
+  const resolved = forced ?? (await resolveProjectRoot());
   projectRoot = resolved.root;
   rootSource = resolved.source;
 
@@ -1282,10 +1626,10 @@ async function initializeIfNeeded(): Promise<void> {
   }
 }
 
-async function ensureInitialized(): Promise<void> {
+async function ensureInitialized(forced?: { root: string; source: RootSource }): Promise<void> {
   if (initialized) return;
   if (!initializationPromise) {
-    initializationPromise = initializeIfNeeded().finally(() => {
+    initializationPromise = initializeIfNeeded(forced).finally(() => {
       if (initialized) return;
       initializationPromise = null;
     });
@@ -1293,9 +1637,48 @@ async function ensureInitialized(): Promise<void> {
   await initializationPromise;
 }
 
+async function switchProjectRootIfNeeded(next: { root: string; source: RootSource }): Promise<void> {
+  const same = projectRoot && path.resolve(projectRoot) === path.resolve(next.root) && initialized;
+  if (same) return;
+
+  try {
+    await watcher?.close();
+  } catch (err) {
+    console.error("[vectormind] watcher close error:", err);
+  }
+  watcher = null;
+  watcherReady = false;
+  try {
+    db?.close();
+  } catch (err) {
+    console.error("[vectormind] db close error:", err);
+  }
+
+  initialized = false;
+  initializationPromise = null;
+  await ensureInitialized(next);
+}
+
+async function ensureInitializedForArgs(rawArgs: Record<string, unknown>): Promise<void> {
+  const fromToolArg = resolveRootFromToolArgOrThrow(rawArgs.project_root);
+  if (fromToolArg) {
+    await switchProjectRootIfNeeded(fromToolArg);
+    return;
+  }
+  await ensureInitialized();
+}
+
 server.oninitialized = () => {
-  void ensureInitialized();
+  // Do not eagerly initialize: prefer initializing on first tool call so callers can
+  // provide `project_root` when the MCP client doesn't support roots/list.
 };
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[vectormind] unhandledRejection:", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[vectormind] uncaughtException:", err);
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -1315,20 +1698,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "get_brain_dump",
         description:
-          "Restore recent requirements/changes/notes/summary/pending changes. Prefer bootstrap_context() at session start when you also want semantic recall from the local vector store.",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+          "Restore recent requirements/changes/notes/summary/pending changes. Prefer bootstrap_context() at session start when you also want recall from the local memory store.",
+        inputSchema: toJsonSchemaCompat(ProjectRootOnlyArgsSchema),
       },
       {
         name: "bootstrap_context",
         description:
-          "MUST call at the start of every new chat/session. Returns brain dump + pending changes, and (if you pass query) semantic matches from the local vector store to avoid guessing.",
+          "MUST call at the start of every new chat/session. Returns brain dump + pending changes, and (if you pass query) matches from the local memory store to avoid guessing.",
         inputSchema: toJsonSchemaCompat(BootstrapContextArgsSchema),
       },
       {
         name: "get_pending_changes",
         description:
           "List files that changed locally but have not been acknowledged by sync_change_intent yet. Use this to see what needs syncing (or omit files in sync_change_intent to auto-link them).",
-        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+        inputSchema: toJsonSchemaCompat(ProjectRootOnlyArgsSchema),
       },
       {
         name: "query_codebase",
@@ -1363,7 +1746,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const rawArgs = (request.params.arguments ?? {}) as Record<string, unknown>;
 
   try {
-    await ensureInitialized();
+    await ensureInitializedForArgs(rawArgs);
 
     if (toolName === "start_requirement") {
       const args = StartRequirementArgsSchema.parse(rawArgs);
@@ -1402,6 +1785,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "sync_change_intent") {
       const args = SyncChangeIntentArgsSchema.parse(rawArgs);
+      const explicitFiles = (args.files ?? args.affected_files ?? []).filter(
+        (f): f is string => typeof f === "string" && f.length > 0,
+      );
       const active = getActiveRequirementStmt.get() as RequirementRow | undefined;
       if (!active) {
         return {
@@ -1443,9 +1829,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           source: "args" | "pending" | "unspecified";
         }> = [];
 
-        if (args.files.length) {
-          for (const f of args.files) {
-            const rawFile = String(f);
+        if (explicitFiles.length) {
+          for (const rawFile of explicitFiles) {
             const dbFilePath = normalizeToDbPath(rawFile);
             targets.push({ rawFile, dbFilePath, event: "manual", source: "args" });
           }
@@ -1553,12 +1938,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       const q = args.query?.trim() ?? "";
       const semantic =
-        q && embeddingsEnabled
-          ? await semanticSearchInternal({
-              query: q,
-              topK: args.top_k,
-              kinds: args.kinds?.length ? args.kinds : null,
-              includeContent: args.include_content,
+        q
+          ? await Promise.race([
+              semanticSearchHybridInternal({
+                query: q,
+                topK: args.top_k,
+                kinds: args.kinds?.length ? args.kinds : null,
+                includeContent: args.include_content,
+              }),
+              new Promise<null>((resolve) => setTimeout(resolve, BOOTSTRAP_SEMANTIC_TIMEOUT_MS, null)),
+            ]).catch((err) => {
+              console.error("[vectormind] bootstrap semantic_search failed:", err);
+              return null;
             })
           : null;
 
@@ -1723,28 +2114,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (toolName === "semantic_search") {
-      if (!embeddingsEnabled) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  ok: false,
-                  error:
-                    "Embeddings are disabled (set VECTORMIND_EMBEDDINGS=on) so semantic_search is unavailable.",
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
-      }
-
       const args = SemanticSearchArgsSchema.parse(rawArgs);
-      const result = await semanticSearchInternal({
+      const result = await semanticSearchHybridInternal({
         query: args.query,
         topK: args.top_k,
         kinds: args.kinds?.length ? args.kinds : null,

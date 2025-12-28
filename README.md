@@ -17,7 +17,7 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 - **符号索引（symbols）**：实时维护类/函数/类型等符号表，用于快速 query 定位定义位置。
 - **项目总结 & 笔记（memory_items）**：把“项目总结/关键决策/约束/待办”等上下文以结构化条目持久化到本地。
 - **代码片段 & 文档分块索引（memory_items）**：监听文件变更，把代码/文档切成可检索的 chunk 存入本地。
-- **语义检索（embeddings + semantic_search）**：使用本地 embedding 模型把上述内容向量化，支持跨需求/意图/笔记/代码/文档的语义召回。
+- **上下文检索（semantic_search）**：默认使用本地 SQLite FTS 做召回（无需模型）；可选开启 embeddings，用向量相似度增强语义召回。
 - **会话恢复（brain dump）**：新会话开始时一键拉取最近需求与对应的改动意图，AI 直接接着做。
 
 ## 工作流（强烈推荐）
@@ -48,7 +48,7 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 
 ### `bootstrap_context`
 - 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean }`
-- 用途：返回 brain dump + pending changes；如果传入 `query`，会额外返回本地向量库的语义检索结果（推荐新会话开始就用它）
+- 用途：返回 brain dump + pending changes；如果传入 `query`，会额外返回本地记忆库的检索结果（推荐新会话开始就用它）
 
 ### `get_pending_changes`
 - 入参：`{}`
@@ -68,19 +68,19 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 
 ### `semantic_search`
 - 入参：`{ query: string, top_k?: number, kinds?: string[], include_content?: boolean }`
-- 用途：对本地向量库进行语义检索（覆盖需求/意图/笔记/项目总结/代码 chunk/文档 chunk）
+- 用途：对本地记忆库进行检索（覆盖需求/意图/笔记/项目总结/代码 chunk/文档 chunk）。如启用 embeddings，会优先走向量相似度；否则使用本地 FTS/LIKE。
 
 ## 本地数据与监听
 
 - 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind/vectormind.db`（默认已在 `.gitignore` 中忽略整个 `.vectormind/` 目录）
 - 监听范围：默认监听 workspace root（同上）下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
-- 语义向量：默认使用本地 embedding 模型（`@xenova/transformers`），首次运行可能需要下载模型权重（无云端 API 调用，向量与数据都保存在本地）
+- 检索：默认使用本地 SQLite FTS（无需模型）；当你设置 `VECTORMIND_EMBEDDINGS=on` 才会启用向量化（`@xenova/transformers`），并优先用向量相似度做语义召回（首次启用可能下载模型权重，向量与数据都在本地）
 
-## 向量化配置（可选）
+## 检索/向量化配置（可选）
 
 - `VECTORMIND_ROOT=...`：强制指定“项目根目录”（当你的 MCP Client 无法提供 workspace roots 或启动目录不对时使用）
-- `VECTORMIND_EMBEDDINGS=off`：关闭向量化（不会启动本地 embedding 模型；`semantic_search` 不可用；也不会为需求/意图/笔记/总结/代码&文档 chunk 生成向量）
+- `VECTORMIND_EMBEDDINGS=on|off`：是否启用向量化（默认 `off`；开启后会启动本地 embedding 模型，`semantic_search` 优先走向量相似度；关闭则走本地 FTS/LIKE，不会生成向量/启动模型）
 - `VECTORMIND_EMBED_FILES=all|changed|none`：控制是否向量化“代码/文档 chunk”（默认 `all`；`none` 只影响 chunk，仍会向量化需求/意图/笔记/总结；`changed` 仅在 change/manual 时向量化 chunk）
 - `VECTORMIND_EMBED_MODEL=...`：指定 embedding 模型（默认 `Xenova/all-MiniLM-L6-v2`）
 - `VECTORMIND_EMBED_CACHE_DIR=...`：指定模型缓存目录
@@ -157,8 +157,12 @@ npx -y @coreyuan/vector-mind
 
 ### Codex（`config.toml`）：不要固定 MCP Server 的 `cwd`（让它跟随项目）
 
-Codex 目前不会通过 MCP `roots/list` 提供 workspace roots；VectorMind 会用 `VECTORMIND_ROOT`（优先）或 `process.cwd()` 来决定项目根目录。
-因此要实现“每个项目一个 `<project>/.vectormind/`”，请让 Codex 在你的项目目录启动（或用 `codex -C <project>` 指定工作目录），并 **不要** 在 MCP server 配置里把 `cwd` 固定到某个全局目录。
+Codex 目前不会通过 MCP `roots/list` 提供 workspace roots；因此要实现“每个项目一个 `<project>/.vectormind/`”，推荐两种方式：
+
+1) **让 Codex 在你的项目目录启动**（或用 `codex -C <project>` 指定工作目录），然后 VectorMind 就会用 `process.cwd()` 作为 `project_root`。
+2) **在每次工具调用里显式传 `project_root`**（当你的 Codex/VS Code 启动 MCP server 的工作目录不等于项目根目录时尤其有用）。
+
+> `project_root` 可以作为 VectorMind 所有 tools 的可选参数；一旦提供，VectorMind 会切换到该项目并在 `<project_root>/.vectormind/` 下读写数据库与索引。
 
 ```toml
 [mcp_servers.vector-mind]
@@ -173,8 +177,6 @@ args = ["-y", "@coreyuan/vector-mind"]
 - `env = { VECTORMIND_ROOT = "..." }`（同样会锁死到一个项目）
 
 > 如果你确实要固定到单一项目（少见）：那就可以设置 `cwd` 或 `VECTORMIND_ROOT`；但这会破坏“多项目隔离”。
-
-**注意**：VectorMind 的 `project_root` 是在 MCP server 启动时确定的；如果你在同一个 Codex 进程里切换到另一个项目，需要重启 Codex（或重启编辑器）让 MCP server 重新拉起，才能绑定到新项目目录。
 
 配置完成后，客户端会在初始化阶段拿到该服务器的 tools + instructions；AI 就能“知道它存在”，并在需要时调用，而不是盲猜。
 

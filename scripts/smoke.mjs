@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -26,6 +26,7 @@ const enableEmbeddings = embeddings === "on" || embeddings === "true" || embeddi
 const allowRemoteModels = (getFlag("allow-remote-models") ?? "true").toLowerCase();
 const keepFiles = hasFlag("keep-files");
 const inPlace = hasFlag("in-place");
+const useToolProjectRoot = hasFlag("use-tool-project-root");
 
 const env = {
   ...process.env,
@@ -33,10 +34,16 @@ const env = {
   VECTORMIND_ALLOW_REMOTE_MODELS: allowRemoteModels,
 };
 
+const scriptDir = path.dirname(fileURLToPath(import.meta.url));
+const serverEntry = path.resolve(scriptDir, "..", "dist", "index.js");
+
 const runDir = inPlace
   ? process.cwd()
   : fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-smoke-"));
-const serverEntry = path.resolve(process.cwd(), "dist/index.js");
+
+const toolProjectRoot = useToolProjectRoot
+  ? fs.mkdtempSync(path.join(os.tmpdir(), "vectormind-smoke-project-"))
+  : runDir;
 
 const transport = new StdioClientTransport({
   command: "node",
@@ -81,7 +88,11 @@ async function main() {
   const boot = await client.callTool(
     {
       name: "bootstrap_context",
-      arguments: { query: "smoke test: what is VectorMind?", top_k: 5 },
+      arguments: {
+        ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+        query: "smoke test: what is VectorMind?",
+        top_k: 5,
+      },
     },
     undefined,
     { timeout: 10_000 },
@@ -92,14 +103,14 @@ async function main() {
   console.log(bootText);
   try {
     const parsed = JSON.parse(bootText);
-    const expectedRootSource = rootsMode === "on" ? "mcp_roots" : "cwd";
+    const expectedRootSource = useToolProjectRoot ? "tool_arg" : rootsMode === "on" ? "mcp_roots" : "cwd";
     if (parsed?.root_source !== expectedRootSource) {
       throw new Error(`expected root_source=${expectedRootSource}, got ${parsed?.root_source}`);
     }
     if (rootsMode === "hang" && bootElapsedMs > 5_000) {
       throw new Error(`expected bootstrap_context to finish fast when roots hang (got ${bootElapsedMs}ms)`);
     }
-    const expectedDbPath = path.join(runDir, ".vectormind", "vectormind.db");
+    const expectedDbPath = path.join(toolProjectRoot, ".vectormind", "vectormind.db");
     if (!parsed?.db_path) {
       throw new Error("expected db_path in bootstrap_context output");
     }
@@ -117,7 +128,11 @@ async function main() {
 
   const req = await client.callTool({
     name: "start_requirement",
-    arguments: { title: "VectorMind smoke test", background: "basic end-to-end flow" },
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "VectorMind smoke test",
+      background: "basic end-to-end flow",
+    },
   });
   console.log("\n--- start_requirement ---\n");
   console.log(readText(req));
@@ -125,38 +140,53 @@ async function main() {
   await new Promise((r) => setTimeout(r, 1000));
 
   const token = `VM_SMOKE_${Date.now()}`;
-  const testPath = path.join(runDir, "vm_smoke_test.md");
+  const testPath = path.join(toolProjectRoot, "vm_smoke_test.md");
   fs.writeFileSync(testPath, `# Smoke\n\n${token}\n\nThis file should be indexed.\n`);
 
   await new Promise((r) => setTimeout(r, 1000));
 
-  const pending1 = await client.callTool({ name: "get_pending_changes", arguments: {} });
+  const pending1 = await client.callTool({
+    name: "get_pending_changes",
+    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
+  });
   console.log("\n--- get_pending_changes (before) ---\n");
   console.log(readText(pending1));
 
   const sync = await client.callTool({
     name: "sync_change_intent",
     arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
       intent: `smoke: created/changed vm_smoke_test.md (${token})`,
     },
   });
   console.log("\n--- sync_change_intent (auto-link pending) ---\n");
   console.log(readText(sync));
 
-  const pending2 = await client.callTool({ name: "get_pending_changes", arguments: {} });
+  const pending2 = await client.callTool({
+    name: "get_pending_changes",
+    arguments: useToolProjectRoot ? { project_root: toolProjectRoot } : {},
+  });
   console.log("\n--- get_pending_changes (after) ---\n");
   console.log(readText(pending2));
 
   const summary = await client.callTool({
     name: "upsert_project_summary",
-    arguments: { summary: `Smoke summary: created ${path.basename(testPath)} token=${token}` },
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      summary: `Smoke summary: created ${path.basename(testPath)} token=${token}`,
+    },
   });
   console.log("\n--- upsert_project_summary ---\n");
   console.log(readText(summary));
 
   const note = await client.callTool({
     name: "add_note",
-    arguments: { title: "smoke-note", content: `Remember token: ${token}`, tags: ["smoke"] },
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      title: "smoke-note",
+      content: `Remember token: ${token}`,
+      tags: ["smoke"],
+    },
   });
   console.log("\n--- add_note ---\n");
   console.log(readText(note));
@@ -164,15 +194,38 @@ async function main() {
   if (enableEmbeddings) {
     console.log("\n(waiting a bit for background embedding...)\n");
     await new Promise((r) => setTimeout(r, 8000));
+  }
 
-    const search = await client.callTool({
-      name: "semantic_search",
-      arguments: { query: token, top_k: 5, include_content: false },
-    });
-    console.log("\n--- semantic_search ---\n");
-    console.log(readText(search));
-  } else {
-    console.log("\n(embeddings disabled; skip semantic_search)\n");
+  const search = await client.callTool({
+    name: "semantic_search",
+    arguments: {
+      ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
+      query: token,
+      top_k: 5,
+      include_content: false,
+    },
+  });
+  console.log("\n--- semantic_search ---\n");
+  const searchText = readText(search);
+  console.log(searchText);
+  try {
+    const parsed = JSON.parse(searchText);
+    if (parsed?.ok !== true) throw new Error("expected ok=true from semantic_search");
+    const matches = parsed?.matches;
+    if (!Array.isArray(matches) || matches.length === 0) {
+      throw new Error("expected semantic_search to return at least 1 match");
+    }
+    if (enableEmbeddings !== true && !["fts", "like"].includes(parsed?.mode)) {
+      throw new Error(`expected mode to be fts/like when embeddings are off (got ${parsed?.mode})`);
+    }
+    const haystack = JSON.stringify(matches);
+    if (!haystack.includes(token)) {
+      throw new Error("expected semantic_search matches to contain the token");
+    }
+  } catch (err) {
+    console.error("\n[smoke] semantic_search check failed:", err);
+    process.exitCode = 1;
+    return;
   }
 
   if (!keepFiles && inPlace) {
@@ -182,6 +235,7 @@ async function main() {
       const cleanup = await client.callTool({
         name: "sync_change_intent",
         arguments: {
+          ...(useToolProjectRoot ? { project_root: toolProjectRoot } : {}),
           intent: `smoke cleanup: removed ${path.basename(testPath)}`,
           files: [testPath],
         },
@@ -201,6 +255,11 @@ main()
     try {
       await transport.close();
     } catch {}
+    if (!keepFiles && useToolProjectRoot) {
+      try {
+        fs.rmSync(toolProjectRoot, { recursive: true, force: true });
+      } catch {}
+    }
     if (!keepFiles && !inPlace) {
       try {
         fs.rmSync(runDir, { recursive: true, force: true });

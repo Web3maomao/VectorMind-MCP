@@ -18,31 +18,32 @@ Make the assistant use VectorMind MCP by default so project context, intent, and
 
 ### 2) On every new session (or when the user says “继续/恢复/接着做”)
 
-- Call `bootstrap_context({ query: <the user's current goal>, top_k: 5 })` first.
+- Call `bootstrap_context({ project_root: <current project dir>, query: <the user's current goal>, top_k: 5 })` first.
 - Use the returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
 - Do **not** paste raw JSON unless the user asks for it (summarize key facts instead).
 
 ### 3) Before editing code or files
 
-- If this is a new task/feature, call `start_requirement({ title, background })` before changing anything.
+- If this is a new task/feature, call `start_requirement({ project_root: <current project dir>, title, background })` before changing anything.
 - Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria).
 
 ### 4) After editing + saving files
 
-- Call `get_pending_changes()` to see what changed but isn’t yet linked to an intent.
-- Call `sync_change_intent({ intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
+- Call `get_pending_changes({ project_root: <current project dir> })` to see what changed but isn’t yet linked to an intent.
+- Call `sync_change_intent({ project_root: <current project dir>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
   - Prefer omitting `files` to let the server auto-link all pending changes, unless you intentionally want a subset.
   - Write `intent` as a concise, user-facing summary: what changed + why + any follow-ups.
 
 ### 5) When you need to find code or recall context
 
-- If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ query: "X" })` instead of guessing paths.
-- If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ query, top_k, kinds? })` instead of guessing.
+- If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ project_root: <current project dir>, query: "X" })` instead of guessing paths.
+- If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <current project dir>, query, top_k, kinds? })` instead of guessing.
+  - Note: `semantic_search` works even when embeddings are off (uses local SQLite FTS/LIKE). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall.
 
 ### 6) After major milestones (or before ending the session)
 
-- Call `upsert_project_summary({ summary })` to keep a single, up-to-date project summary.
-- Call `add_note({ title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
+- Call `upsert_project_summary({ project_root: <current project dir>, summary })` to keep a single, up-to-date project summary.
+- Call `add_note({ project_root: <current project dir>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
 
 ## Output Policy (user-visible)
 
