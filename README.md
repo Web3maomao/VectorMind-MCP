@@ -172,17 +172,6 @@ args = ["-y", "@coreyuan/vector-mind"]
 - `cwd = "..."`（会把 VectorMind 锁死到一个项目）
 - `env = { VECTORMIND_ROOT = "..." }`（同样会锁死到一个项目）
 
-你贴出来的这种配置会导致：无论你在多少个新项目里使用 Codex，VectorMind 都只会在这个写死目录里生成/更新 `.vectormind/`：
-
-```toml
-[mcp_servers.vector-mind]
-type = "stdio"
-command = "npx"
-args = ["-y", "@coreyuan/vector-mind"]
-cwd = "H:\\\\2024\\\\SJiuTool\\\\SJiuTool"
-env = { VECTORMIND_ROOT = "H:\\\\2024\\\\SJiuTool\\\\SJiuTool" }
-```
-
 > 如果你确实要固定到单一项目（少见）：那就可以设置 `cwd` 或 `VECTORMIND_ROOT`；但这会破坏“多项目隔离”。
 
 **注意**：VectorMind 的 `project_root` 是在 MCP server 启动时确定的；如果你在同一个 Codex 进程里切换到另一个项目，需要重启 Codex（或重启编辑器）让 MCP server 重新拉起，才能绑定到新项目目录。
