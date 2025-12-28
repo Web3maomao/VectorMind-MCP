@@ -29,3 +29,7 @@ Follow this workflow:
 
 Output policy:
 - Do not dump raw JSON tool output unless the user asks; summarize key facts instead.
+
+Safety / setup notes:
+- Do not auto-edit the user’s global MCP client config to hardcode `cwd` or `VECTORMIND_ROOT` for a single project. That breaks per-project isolation.
+- If VectorMind is writing to the wrong directory, instruct the user to restart the client from the correct project folder (or use the client’s equivalent of `-C <project>`), or set `VECTORMIND_ROOT` only for that session.

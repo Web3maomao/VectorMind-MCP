@@ -17,6 +17,9 @@ function hasFlag(name) {
   return process.argv.includes(`--${name}`);
 }
 
+const rootsMode = (getFlag("roots") ?? "on").toLowerCase();
+const enableRoots = rootsMode !== "off";
+
 const embeddings = (getFlag("embeddings") ?? "off").toLowerCase();
 const enableEmbeddings = embeddings === "on" || embeddings === "true" || embeddings === "1";
 
@@ -45,7 +48,7 @@ const transport = new StdioClientTransport({
 
 const client = new Client(
   { name: "vectormind-smoke", version: "0.0.0" },
-  { capabilities: { roots: {} } },
+  { capabilities: enableRoots ? { roots: {} } : {} },
 );
 
 function readText(result) {
@@ -54,9 +57,13 @@ function readText(result) {
 }
 
 async function main() {
-  client.setRequestHandler(ListRootsRequestSchema, async () => ({
-    roots: [{ uri: pathToFileURL(runDir).toString(), name: "vectormind-smoke" }],
-  }));
+  if (rootsMode === "on") {
+    client.setRequestHandler(ListRootsRequestSchema, async () => ({
+      roots: [{ uri: pathToFileURL(runDir).toString(), name: "vectormind-smoke" }],
+    }));
+  } else if (rootsMode === "hang") {
+    client.setRequestHandler(ListRootsRequestSchema, async () => new Promise(() => {}));
+  }
 
   await client.connect(transport);
 
@@ -70,17 +77,27 @@ async function main() {
   console.log("\n--- tools ---\n");
   console.log(toolList.tools.map((t) => t.name).sort().join(", "));
 
-  const boot = await client.callTool({
-    name: "bootstrap_context",
-    arguments: { query: "smoke test: what is VectorMind?", top_k: 5 },
-  });
+  const bootStart = Date.now();
+  const boot = await client.callTool(
+    {
+      name: "bootstrap_context",
+      arguments: { query: "smoke test: what is VectorMind?", top_k: 5 },
+    },
+    undefined,
+    { timeout: 10_000 },
+  );
+  const bootElapsedMs = Date.now() - bootStart;
   console.log("\n--- bootstrap_context ---\n");
   const bootText = readText(boot);
   console.log(bootText);
   try {
     const parsed = JSON.parse(bootText);
-    if (parsed?.root_source !== "mcp_roots") {
-      throw new Error(`expected root_source=mcp_roots, got ${parsed?.root_source}`);
+    const expectedRootSource = rootsMode === "on" ? "mcp_roots" : "cwd";
+    if (parsed?.root_source !== expectedRootSource) {
+      throw new Error(`expected root_source=${expectedRootSource}, got ${parsed?.root_source}`);
+    }
+    if (rootsMode === "hang" && bootElapsedMs > 5_000) {
+      throw new Error(`expected bootstrap_context to finish fast when roots hang (got ${bootElapsedMs}ms)`);
     }
     const expectedDbPath = path.join(runDir, ".vectormind", "vectormind.db");
     if (!parsed?.db_path) {

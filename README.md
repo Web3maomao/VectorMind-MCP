@@ -80,8 +80,8 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 ## 向量化配置（可选）
 
 - `VECTORMIND_ROOT=...`：强制指定“项目根目录”（当你的 MCP Client 无法提供 workspace roots 或启动目录不对时使用）
-- `VECTORMIND_EMBEDDINGS=off`：关闭向量化（`semantic_search` 不可用）
-- `VECTORMIND_EMBED_FILES=all|changed|none`：是否向量化代码/文档 chunk（默认 `all`）
+- `VECTORMIND_EMBEDDINGS=off`：关闭向量化（不会启动本地 embedding 模型；`semantic_search` 不可用；也不会为需求/意图/笔记/总结/代码&文档 chunk 生成向量）
+- `VECTORMIND_EMBED_FILES=all|changed|none`：控制是否向量化“代码/文档 chunk”（默认 `all`；`none` 只影响 chunk，仍会向量化需求/意图/笔记/总结；`changed` 仅在 change/manual 时向量化 chunk）
 - `VECTORMIND_EMBED_MODEL=...`：指定 embedding 模型（默认 `Xenova/all-MiniLM-L6-v2`）
 - `VECTORMIND_EMBED_CACHE_DIR=...`：指定模型缓存目录
 - `VECTORMIND_ALLOW_REMOTE_MODELS=false`：禁止下载远端模型（适合离线环境）
@@ -137,6 +137,8 @@ npx -y @coreyuan/vector-mind
   - `args`: `["-y", "@coreyuan/vector-mind"]`
 
 通常情况下客户端会通过 MCP `roots/list` 自动提供 workspace root，因此无需写死目录，配置如下：
+
+> 如果客户端不支持或不响应 `roots/list`，VectorMind 会快速回退到 `process.cwd()`（可用 `VECTORMIND_ROOTS_TIMEOUT_MS` 调整 roots 请求超时时间，默认 750ms）。
 ```json
 {
   "command": "npx",
@@ -152,6 +154,38 @@ npx -y @coreyuan/vector-mind
   "env": { "VECTORMIND_ROOT": "H:\\\\path\\\\to\\\\your-project" }
 }
 ```
+
+### Codex（`config.toml`）：不要固定 MCP Server 的 `cwd`（让它跟随项目）
+
+Codex 目前不会通过 MCP `roots/list` 提供 workspace roots；VectorMind 会用 `VECTORMIND_ROOT`（优先）或 `process.cwd()` 来决定项目根目录。
+因此要实现“每个项目一个 `<project>/.vectormind/`”，请让 Codex 在你的项目目录启动（或用 `codex -C <project>` 指定工作目录），并 **不要** 在 MCP server 配置里把 `cwd` 固定到某个全局目录。
+
+```toml
+[mcp_servers.vector-mind]
+type = "stdio"
+command = "npx"
+args = ["-y", "@coreyuan/vector-mind"]
+# 不要设置 cwd：让它跟随 Codex 的工作目录（也就是你的项目目录）
+```
+
+**不要在全局 `config.toml` 里写死：**
+- `cwd = "..."`（会把 VectorMind 锁死到一个项目）
+- `env = { VECTORMIND_ROOT = "..." }`（同样会锁死到一个项目）
+
+你贴出来的这种配置会导致：无论你在多少个新项目里使用 Codex，VectorMind 都只会在这个写死目录里生成/更新 `.vectormind/`：
+
+```toml
+[mcp_servers.vector-mind]
+type = "stdio"
+command = "npx"
+args = ["-y", "@coreyuan/vector-mind"]
+cwd = "H:\\\\2024\\\\SJiuTool\\\\SJiuTool"
+env = { VECTORMIND_ROOT = "H:\\\\2024\\\\SJiuTool\\\\SJiuTool" }
+```
+
+> 如果你确实要固定到单一项目（少见）：那就可以设置 `cwd` 或 `VECTORMIND_ROOT`；但这会破坏“多项目隔离”。
+
+**注意**：VectorMind 的 `project_root` 是在 MCP server 启动时确定的；如果你在同一个 Codex 进程里切换到另一个项目，需要重启 Codex（或重启编辑器）让 MCP server 重新拉起，才能绑定到新项目目录。
 
 配置完成后，客户端会在初始化阶段拿到该服务器的 tools + instructions；AI 就能“知道它存在”，并在需要时调用，而不是盲猜。
 

@@ -62,11 +62,19 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.2";
+const SERVER_VERSION = "1.0.4";
 
-type RootSource = "env" | "mcp_roots" | "cwd";
+type RootSource = "env" | "mcp_roots" | "cwd" | "fallback";
 
 const rootFromEnv = process.env.VECTORMIND_ROOT?.trim() ?? "";
+
+const ROOTS_LIST_TIMEOUT_MS = (() => {
+  const raw = process.env.VECTORMIND_ROOTS_TIMEOUT_MS?.trim();
+  if (!raw) return 750;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 750;
+  return n;
+})();
 
 let initialized = false;
 let rootSource: RootSource = "cwd";
@@ -106,6 +114,33 @@ let indexFileSymbolsTx:
 function isProbablyVscodeInstallDir(dir: string): boolean {
   const lower = dir.replace(/\\/g, "/").toLowerCase();
   return lower.includes("/microsoft vs code");
+}
+
+function getVsCodeUserDirCandidate(): string | null {
+  const platform = process.platform;
+  if (platform === "win32") {
+    const appData = process.env.APPDATA?.trim();
+    const roaming = appData || path.join(os.homedir(), "AppData", "Roaming");
+    return path.join(roaming, "Code", "User");
+  }
+  if (platform === "darwin") {
+    return path.join(os.homedir(), "Library", "Application Support", "Code", "User");
+  }
+  return path.join(os.homedir(), ".config", "Code", "User");
+}
+
+function resolveSafeFallbackRootDir(): string {
+  const candidate = getVsCodeUserDirCandidate();
+  if (candidate) {
+    try {
+      fs.mkdirSync(candidate, { recursive: true });
+      const st = fs.statSync(candidate);
+      if (st.isDirectory()) return candidate;
+    } catch {
+      // ignore
+    }
+  }
+  return os.homedir();
 }
 
 function parseFileUriToPath(uri: string): string | null {
@@ -882,7 +917,7 @@ const server = new Server(
     capabilities: { tools: {} },
     instructions: [
       "VectorMind MCP is available in this session. Use it to avoid guessing project context.",
-      "Project root is resolved from MCP roots/list (preferred), else VECTORMIND_ROOT, else process.cwd().",
+      "Project root is resolved from VECTORMIND_ROOT (override; avoid hardcoding in global config), else MCP roots/list (best-effort; falls back quickly if unsupported), else process.cwd() (so start your MCP client in the project directory for per-project isolation).",
       "",
       "Required workflow:",
       "- On every new conversation/session: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local vector store.",
@@ -898,8 +933,11 @@ const server = new Server(
 );
 
 async function resolveProjectRootFromMcpRoots(): Promise<string | null> {
+  const caps = server.getClientCapabilities();
+  if (!caps?.roots) return null;
+
   try {
-    const result = await server.listRoots({});
+    const result = await server.listRoots({}, { timeout: ROOTS_LIST_TIMEOUT_MS });
     for (const r of result.roots ?? []) {
       const p = parseFileUriToPath(r.uri);
       if (!p) continue;
@@ -925,11 +963,7 @@ async function resolveProjectRoot(): Promise<{ root: string; source: RootSource 
 
   const cwd = process.cwd();
   if (isProbablyVscodeInstallDir(cwd)) {
-    throw new Error(
-      "[VectorMind] Unable to determine a project root. " +
-        "Your MCP client started the server in the VS Code install directory. " +
-        "Use a client that provides MCP roots (roots/list), or set VECTORMIND_ROOT explicitly.",
-    );
+    return { root: resolveSafeFallbackRootDir(), source: "fallback" };
   }
   return { root: cwd, source: "cwd" };
 }

@@ -51,6 +51,13 @@ Make the assistant use VectorMind MCP by default so project context, intent, and
 
 ## Setup / Troubleshooting
 
+### Don’t hardcode a single project in global config
+
+- If you set `[mcp_servers.vector-mind].cwd` or `env.VECTORMIND_ROOT` inside the **global** `~/.codex/config.toml`, VectorMind will be locked to that one directory and will NOT create `<project>/.vectormind/` for other projects.
+- For per-project isolation, remove those keys, restart Codex, and start Codex inside the target project directory (or use `codex -C <project>`).
+- VectorMind resolves `project_root` when the MCP server starts; switching projects in the same client process may require restarting the client/editor to re-bind to the new project.
+- As the assistant, do **not** auto-edit the user’s global config to hardcode per-project paths unless the user explicitly asks you to.
+
 ### VectorMind tools are missing
 
 - Configure your MCP client to run VectorMind via stdio (published package example): `npx -y @coreyuan/vector-mind`.
