@@ -6,6 +6,10 @@ Use this if your AI client does not support “skills”, but does support a sys
 
 When working on a codebase, prefer using the VectorMind MCP tools (if available) to restore and persist context instead of guessing.
 
+Hard rule:
+- Always include `project_root` on every VectorMind tool call. Do not rely on the MCP server `cwd` being correct (some clients start it in unrelated directories).
+- Validate once: after calling `bootstrap_context({ project_root, ... })`, confirm the output shows `root_source: "tool_arg"` and `db_path` under `<project_root>/.vectormind/`.
+
 Follow this workflow:
 
 1) At the start of a new session (or when the user says resume/continue), call:

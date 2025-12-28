@@ -1,6 +1,6 @@
 ---
 name: vector-mind-autopilot
-description: "Automatically apply the VectorMind MCP workflow (local requirement-driven memory): bootstrap_context on session start, start_requirement before edits, sync_change_intent after saves, and semantic_search/query_codebase instead of guessing. Use for coding work when VectorMind MCP is configured."
+description: "Automatically apply the VectorMind MCP workflow (local requirement-driven memory) and ALWAYS pass project_root in every VectorMind tool call (critical for Codex VS Code plugin where cwd/roots may be wrong): bootstrap_context on session start, start_requirement before edits, sync_change_intent after saves, and semantic_search/query_codebase instead of guessing. Use for coding work when VectorMind MCP is configured."
 ---
 
 # VectorMind Autopilot (MCP)
@@ -8,6 +8,28 @@ description: "Automatically apply the VectorMind MCP workflow (local requirement
 ## Goal
 
 Make the assistant use VectorMind MCP by default so project context, intent, and progress are restored and persisted locally without the user manually asking for MCP calls.
+
+## Hard Rule: Always include `project_root`
+
+In many clients (especially the **Codex VS Code plugin**), the MCP server process may start with an unrelated `cwd` (e.g. `C:\\Windows\\System32`) and without `roots/list`. In that case VectorMind will fall back to the VS Code User directory, which breaks per-project isolation.
+
+Therefore:
+
+- **Always pass `project_root` on every VectorMind tool call** (including `bootstrap_context`, `get_brain_dump`, `get_pending_changes`, etc.).
+- Reuse the same `project_root` consistently within the same task.
+- If you switch to a different project in the same chat, pass the new `project_root` on the next tool call (VectorMind can re-bind per call).
+
+### How to choose `project_root` (best-effort)
+
+1) If the user mentions a project path explicitly, use that exact directory.
+2) Otherwise, infer it from the **active file / open tabs paths** in the conversation context:
+   - Prefer the workspace folder that contains the files being discussed.
+   - If you can check the filesystem, walk upward until you find a marker like `.git/` (or a root file like `package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`, `*.sln`), and use that directory.
+3) Validate the choice once by calling `bootstrap_context({ project_root, query: "<goal>" })` and confirm:
+   - `root_source` is `"tool_arg"`
+   - `db_path` is under `<project_root>/.vectormind/`
+
+If you still cannot determine it confidently, ask the user for the project root path (do not guess).
 
 ## Default Workflow (do this unless explicitly unnecessary)
 
@@ -18,32 +40,32 @@ Make the assistant use VectorMind MCP by default so project context, intent, and
 
 ### 2) On every new session (or when the user says “继续/恢复/接着做”)
 
-- Call `bootstrap_context({ project_root: <current project dir>, query: <the user's current goal>, top_k: 5 })` first.
+- Call `bootstrap_context({ project_root: <PROJECT_ROOT>, query: <the user's current goal>, top_k: 5 })` first.
 - Use the returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
 - Do **not** paste raw JSON unless the user asks for it (summarize key facts instead).
 
 ### 3) Before editing code or files
 
-- If this is a new task/feature, call `start_requirement({ project_root: <current project dir>, title, background })` before changing anything.
+- If this is a new task/feature, call `start_requirement({ project_root: <PROJECT_ROOT>, title, background })` before changing anything.
 - Prefer short, specific titles (e.g., “Add avatar upload”) and put constraints in `background` (formats, edge cases, acceptance criteria).
 
 ### 4) After editing + saving files
 
-- Call `get_pending_changes({ project_root: <current project dir> })` to see what changed but isn’t yet linked to an intent.
-- Call `sync_change_intent({ project_root: <current project dir>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
+- Call `get_pending_changes({ project_root: <PROJECT_ROOT> })` to see what changed but isn’t yet linked to an intent.
+- Call `sync_change_intent({ project_root: <PROJECT_ROOT>, intent, files? })` to archive the “what/why” and associate the changes to the active requirement.
   - Prefer omitting `files` to let the server auto-link all pending changes, unless you intentionally want a subset.
   - Write `intent` as a concise, user-facing summary: what changed + why + any follow-ups.
 
 ### 5) When you need to find code or recall context
 
-- If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ project_root: <current project dir>, query: "X" })` instead of guessing paths.
-- If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <current project dir>, query, top_k, kinds? })` instead of guessing.
+- If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ project_root: <PROJECT_ROOT>, query: "X" })` instead of guessing paths.
+- If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
   - Note: `semantic_search` works even when embeddings are off (uses local SQLite FTS/LIKE). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall.
 
 ### 6) After major milestones (or before ending the session)
 
-- Call `upsert_project_summary({ project_root: <current project dir>, summary })` to keep a single, up-to-date project summary.
-- Call `add_note({ project_root: <current project dir>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
+- Call `upsert_project_summary({ project_root: <PROJECT_ROOT>, summary })` to keep a single, up-to-date project summary.
+- Call `add_note({ project_root: <PROJECT_ROOT>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
 
 ## Output Policy (user-visible)
 

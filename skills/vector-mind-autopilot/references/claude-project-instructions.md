@@ -9,25 +9,25 @@ When the VectorMind MCP tools are available in this chat, use them by default to
 ### Required workflow
 
 1) **At the start of every new chat/session** (or when the user says “继续/恢复/接着做”):
-   - Call: `bootstrap_context({ query: "<用户当前目标/问题>", top_k: 5 })`
+   - Call: `bootstrap_context({ project_root: "<项目根目录>", query: "<用户当前目标/问题>", top_k: 5 })`
    - Use returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan.
 
 2) **Before editing any code/files** for a new task/feature:
-   - Call: `start_requirement({ title: "<简短需求标题>", background: "<约束/验收标准/风险点>" })`
+   - Call: `start_requirement({ project_root: "<项目根目录>", title: "<简短需求标题>", background: "<约束/验收标准/风险点>" })`
 
 3) **After editing + saving files**:
-   - Call: `get_pending_changes()`
-   - Then call: `sync_change_intent({ intent: "<改了什么 + 为什么 + 下一步>", files?: <通常省略，让服务端自动关联 pending> })`
+   - Call: `get_pending_changes({ project_root: "<项目根目录>" })`
+   - Then call: `sync_change_intent({ project_root: "<项目根目录>", intent: "<改了什么 + 为什么 + 下一步>", files?: <通常省略，让服务端自动关联 pending> })`
 
 4) **When locating code**:
-   - Call: `query_codebase({ query: "<符号名/关键词>" })` instead of guessing file paths.
+   - Call: `query_codebase({ project_root: "<项目根目录>", query: "<符号名/关键词>" })` instead of guessing file paths.
 
 5) **When recalling history / notes / code / docs**:
-   - Call: `semantic_search({ query: "<问题>", top_k: 8 })` instead of guessing.
+   - Call: `semantic_search({ project_root: "<项目根目录>", query: "<问题>", top_k: 8 })` instead of guessing.
 
 6) **After major milestones**:
-   - Call: `upsert_project_summary({ summary: "<当前进度 + 已完成 + 未解决问题 + 下一步>" })`
-   - Optionally call: `add_note({ title?, content, tags? })` for durable decisions/constraints/TODOs.
+   - Call: `upsert_project_summary({ project_root: "<项目根目录>", summary: "<当前进度 + 已完成 + 未解决问题 + 下一步>" })`
+   - Optionally call: `add_note({ project_root: "<项目根目录>", title?, content, tags? })` for durable decisions/constraints/TODOs.
 
 ### Output policy
 
