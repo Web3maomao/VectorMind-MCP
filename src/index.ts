@@ -62,7 +62,7 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.8";
+const SERVER_VERSION = "1.0.9";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -298,16 +298,81 @@ function normalizeToDbPath(inputPath: string): string {
   return candidate.replace(/\\/g, "/");
 }
 
+const IGNORED_PATH_SEGMENTS = new Set(
+  [
+    // VCS / tooling
+    ".git",
+    ".hg",
+    ".svn",
+    ".idea",
+    ".vscode",
+
+    // VectorMind artifacts
+    ".vectormind",
+
+    // Node ecosystem
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+
+    // .NET / VS build artifacts
+    "bin",
+    "obj",
+    ".vs",
+    "testresults",
+
+    // General build outputs
+    "dist",
+    "build",
+    "out",
+    "target",
+    "coverage",
+
+    // Python caches/venvs
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "env",
+    ".tox",
+    ".nox",
+
+    // C/C++ common build dirs
+    "cmakefiles",
+    "debug",
+    "release",
+    "x64",
+    "x86",
+  ].map((s) => s.toLowerCase()),
+);
+
+function pathHasIgnoredSegments(posixPath: string): boolean {
+  const segments = posixPath
+    .replace(/\\/g, "/")
+    .split("/")
+    .filter(Boolean)
+    .map((s) => s.toLowerCase());
+  for (const seg of segments) {
+    if (IGNORED_PATH_SEGMENTS.has(seg)) return true;
+  }
+  return false;
+}
+
+function shouldIgnoreDbFilePath(filePath: string | null): boolean {
+  if (!filePath) return false;
+  return pathHasIgnoredSegments(filePath);
+}
+
 function shouldIgnorePath(inputPath: string): boolean {
   const normalizedAbs = path.resolve(inputPath);
   const rel = path.relative(projectRoot, normalizedAbs);
   if (rel.startsWith("..") || path.isAbsolute(rel)) return true;
 
   const relPosix = rel.replace(/\\/g, "/");
-  const top = relPosix.split("/")[0];
-  if (top === "node_modules" || top === ".git" || top === "dist" || top === ".vectormind") {
-    return true;
-  }
+  if (pathHasIgnoredSegments(relPosix)) return true;
 
   // Backward-compat ignore (pre-1.0.2 stored the DB in repo root)
   if (
@@ -1025,6 +1090,8 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
   const embedder = await getEmbedder();
   const qVec = await embedder(q);
 
+  const rawLimit = Math.min(500, Math.max(opts.topK, opts.topK * 8));
+
   let candidateRows: Array<{ memory_id: number; dim: number; vector: Buffer }> = [];
   if (opts.kinds?.length) {
     const placeholders = opts.kinds.map(() => "?").join(", ");
@@ -1053,7 +1120,7 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
     if (row.dim !== v.length || v.length !== qVec.length) continue;
     const score = dotProduct(qVec, v);
 
-    if (top.length < opts.topK) {
+    if (top.length < rawLimit) {
       top.push({ memory_id: row.memory_id, score });
       top.sort((a, b) => b.score - a.score);
       continue;
@@ -1086,7 +1153,8 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
     };
   }>;
 
-  return { query: q, top_k: opts.topK, mode: "embeddings", matches };
+  const filtered = matches.filter((m) => !shouldIgnoreDbFilePath(m.item.file_path)).slice(0, opts.topK);
+  return { query: q, top_k: opts.topK, mode: "embeddings", matches: filtered };
 }
 
 function buildFtsMatchQuery(raw: string): string {
@@ -1108,6 +1176,7 @@ function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   const q = opts.query.trim();
   if (!q) return { query: "", top_k: opts.topK, mode: "fts", matches: [] };
   const matchQuery = buildFtsMatchQuery(q);
+  const rawLimit = Math.min(500, Math.max(opts.topK, opts.topK * 8));
 
   const rows: Array<FtsSearchRow> = (() => {
     if (opts.kinds?.length) {
@@ -1132,7 +1201,7 @@ function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
         ORDER BY rank ASC
         LIMIT ?
       `);
-      return stmt.all(matchQuery, ...opts.kinds, opts.topK) as Array<FtsSearchRow>;
+      return stmt.all(matchQuery, ...opts.kinds, rawLimit) as Array<FtsSearchRow>;
     }
 
     const stmt = db.prepare(`
@@ -1154,10 +1223,13 @@ function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
       ORDER BY rank ASC
       LIMIT ?
     `);
-    return stmt.all(matchQuery, opts.topK) as Array<FtsSearchRow>;
+    return stmt.all(matchQuery, rawLimit) as Array<FtsSearchRow>;
   })();
 
-  const matches = rows.map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent));
+  const matches = rows
+    .map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent))
+    .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
+    .slice(0, opts.topK);
   return { query: q, top_k: opts.topK, mode: "fts", matches };
 }
 
@@ -1169,6 +1241,7 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   if (!q) return { query: "", top_k: opts.topK, mode: "like", matches: [] };
   const escaped = escapeLike(q);
   const like = `%${escaped}%`;
+  const rawLimit = Math.min(500, Math.max(opts.topK, opts.topK * 8));
 
   const rows: Array<LikeSearchRow> = (() => {
     if (opts.kinds?.length) {
@@ -1198,7 +1271,7 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
         ORDER BY score DESC, updated_at DESC, id DESC
         LIMIT ?
       `);
-      return stmt.all(like, like, like, like, like, ...opts.kinds, opts.topK) as Array<LikeSearchRow>;
+      return stmt.all(like, like, like, like, like, ...opts.kinds, rawLimit) as Array<LikeSearchRow>;
     }
 
     const stmt = db.prepare(`
@@ -1225,10 +1298,13 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
       ORDER BY score DESC, updated_at DESC, id DESC
       LIMIT ?
     `);
-    return stmt.all(like, like, like, like, like, opts.topK) as Array<LikeSearchRow>;
+    return stmt.all(like, like, like, like, like, rawLimit) as Array<LikeSearchRow>;
   })();
 
-  const matches = rows.map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent));
+  const matches = rows
+    .map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent))
+    .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
+    .slice(0, opts.topK);
   return { query: q, top_k: opts.topK, mode: "like", matches };
 }
 
@@ -2135,13 +2211,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const q = args.query.trim();
       const escaped = escapeLike(q);
       const like = `%${escaped}%`;
-      const rows = searchSymbolsStmt.all(like, like, q, like, 50) as SymbolRow[];
+      const rows = searchSymbolsStmt.all(like, like, q, like, 250) as SymbolRow[];
+      const filtered = rows.filter((r) => !shouldIgnoreDbFilePath(r.file_path)).slice(0, 50);
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, query: q, matches: rows }, null, 2),
+            text: JSON.stringify({ ok: true, query: q, matches: filtered }, null, 2),
           },
         ],
       };

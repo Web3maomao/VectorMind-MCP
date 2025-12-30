@@ -76,7 +76,7 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 ## 本地数据与监听
 
 - 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind/vectormind.db`（默认已在 `.gitignore` 中忽略整个 `.vectormind/` 目录）
-- 监听范围：默认监听 workspace root（同上）下文件变动（忽略 `.git/`、`node_modules/`、`dist/`、数据库文件）
+- 监听范围：默认监听 workspace root（同上）下文件变动（默认忽略 `.git/`、`node_modules/`（含子目录）、`.vs/`、`bin/`、`obj/`、`dist/`、`build/`、`out/`、数据库文件等常见噪音目录/产物）
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
 - 检索：默认使用本地 SQLite FTS（无需模型）；当你设置 `VECTORMIND_EMBEDDINGS=on` 才会启用向量化（`@xenova/transformers`），并优先用向量相似度做语义召回（首次启用可能下载模型权重，向量与数据都在本地）
 
