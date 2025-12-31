@@ -62,7 +62,7 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.9";
+const SERVER_VERSION = "1.0.10";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
@@ -109,6 +109,8 @@ let getEmbeddingMetaStmt: Database.Statement;
 let upsertEmbeddingStmt: Database.Statement;
 let upsertPendingChangeStmt: Database.Statement;
 let listPendingChangesStmt: Database.Statement;
+let listPendingChangesPageStmt: Database.Statement;
+let countPendingChangesStmt: Database.Statement;
 let deletePendingChangeStmt: Database.Statement;
 let deleteAllPendingChangesStmt: Database.Statement;
 let deleteSymbolsForFileStmt: Database.Statement;
@@ -349,6 +351,15 @@ const IGNORED_PATH_SEGMENTS = new Set(
   ].map((s) => s.toLowerCase()),
 );
 
+const IGNORED_LIKE_PATTERNS = (() => {
+  const patterns: string[] = [];
+  for (const seg of IGNORED_PATH_SEGMENTS) {
+    patterns.push(`${seg}/%`);
+    patterns.push(`%/${seg}/%`);
+  }
+  return patterns;
+})();
+
 function pathHasIgnoredSegments(posixPath: string): boolean {
   const segments = posixPath
     .replace(/\\/g, "/")
@@ -364,6 +375,17 @@ function pathHasIgnoredSegments(posixPath: string): boolean {
 function shouldIgnoreDbFilePath(filePath: string | null): boolean {
   if (!filePath) return false;
   return pathHasIgnoredSegments(filePath);
+}
+
+function pruneIgnoredPendingChanges(): void {
+  if (!db) return;
+  try {
+    if (!IGNORED_LIKE_PATTERNS.length) return;
+    const where = IGNORED_LIKE_PATTERNS.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+    db.prepare(`DELETE FROM pending_changes WHERE ${where}`).run(...IGNORED_LIKE_PATTERNS);
+  } catch (err) {
+    console.error("[vectormind] prune pending_changes failed:", err);
+  }
 }
 
 function shouldIgnorePath(inputPath: string): boolean {
@@ -820,12 +842,31 @@ const AddNoteArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
+const DEFAULT_PENDING_LIMIT = 200;
+const MAX_PENDING_LIMIT = 2000;
+
+const PendingPagingSchema = z.object({
+  pending_offset: z.number().int().min(0).optional().default(0),
+  pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
+});
+
+const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    offset: z.number().int().min(0).optional().default(0),
+    limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
+  }),
+);
+
+const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema);
+
 const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     query: z.string().optional(),
     top_k: z.number().int().min(1).max(50).optional().default(10),
     kinds: z.array(z.string().min(1)).optional(),
     include_content: z.boolean().optional().default(false),
+    pending_offset: z.number().int().min(0).optional().default(0),
+    pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
   }),
 );
 
@@ -1683,6 +1724,13 @@ function initDatabase(): void {
      FROM pending_changes
      ORDER BY updated_at DESC`,
   );
+  listPendingChangesPageStmt = db.prepare(
+    `SELECT file_path, last_event, updated_at
+     FROM pending_changes
+     ORDER BY updated_at DESC
+     LIMIT ? OFFSET ?`,
+  );
+  countPendingChangesStmt = db.prepare(`SELECT COUNT(*) as total FROM pending_changes`);
   deletePendingChangeStmt = db.prepare(
     `DELETE FROM pending_changes WHERE file_path = ?`,
   );
@@ -1715,6 +1763,9 @@ function initDatabase(): void {
       upsertSymbolStmt.run(s.name, s.type, filePath, s.signature);
     }
   });
+
+  // Clean up noisy pending changes recorded by older versions (build artifacts, node_modules, etc).
+  pruneIgnoredPendingChanges();
 }
 
 function initWatcher(): void {
@@ -1858,7 +1909,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "get_brain_dump",
         description:
           "Restore recent requirements/changes/notes/summary/pending changes. Prefer bootstrap_context() at session start when you also want recall from the local memory store.",
-        inputSchema: toJsonSchemaCompat(ProjectRootOnlyArgsSchema),
+        inputSchema: toJsonSchemaCompat(GetBrainDumpArgsSchema),
       },
       {
         name: "bootstrap_context",
@@ -1870,7 +1921,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "get_pending_changes",
         description:
           "List files that changed locally but have not been acknowledged by sync_change_intent yet. Use this to see what needs syncing (or omit files in sync_change_intent to auto-link them).",
-        inputSchema: toJsonSchemaCompat(ProjectRootOnlyArgsSchema),
+        inputSchema: toJsonSchemaCompat(GetPendingChangesArgsSchema),
       },
       {
         name: "query_codebase",
@@ -1997,18 +2048,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             deletePendingChangeStmt.run(t.dbFilePath);
           }
         } else {
-          const pending = listPendingChangesStmt.all() as Array<{
+          const pendingAll = listPendingChangesStmt.all() as Array<{
             file_path: string;
             last_event: string;
             updated_at: string;
           }>;
-          if (pending.length) {
-            for (const p of pending) {
+          if (pendingAll.length) {
+            const pending = pendingAll.filter((p) => !shouldIgnoreDbFilePath(p.file_path));
+            if (pending.length) {
+              for (const p of pending) {
+                targets.push({
+                  rawFile: p.file_path,
+                  dbFilePath: p.file_path,
+                  event: p.last_event,
+                  source: "pending",
+                });
+              }
+            } else {
               targets.push({
-                rawFile: p.file_path,
-                dbFilePath: p.file_path,
-                event: p.last_event,
-                source: "pending",
+                rawFile: "(unspecified)",
+                dbFilePath: "(unspecified)",
+                event: "manual",
+                source: "unspecified",
               });
             }
             deleteAllPendingChangesStmt.run();
@@ -2089,11 +2150,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const project_summary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
       const recent_notes = listRecentNotesStmt.all(10) as MemoryItemRow[];
-      const pending_changes = listPendingChangesStmt.all() as Array<{
+      const pending_total = Number(
+        (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
+      );
+      const pending_offset = args.pending_offset;
+      const pending_limit = args.pending_limit;
+      const pending_truncated = pending_total > pending_offset + pending_limit;
+
+      const pending_changes = (listPendingChangesPageStmt.all(pending_limit, pending_offset) as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>;
+      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
 
       const q = args.query?.trim() ?? "";
       const semantic =
@@ -2120,18 +2188,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               {
                 ok: true,
                 generated_at: new Date().toISOString(),
-                 project_root: projectRoot,
-                 root_source: rootSource,
-                 db_path: dbPath,
-                 watcher_enabled: !!watcher,
-                 watcher_ready: watcherReady,
-                 embeddings: {
-                   enabled: embeddingsEnabled,
-                   model: embedModelName,
+                project_root: projectRoot,
+                root_source: rootSource,
+                db_path: dbPath,
+                watcher_enabled: !!watcher,
+                watcher_ready: watcherReady,
+                embeddings: {
+                  enabled: embeddingsEnabled,
+                  model: embedModelName,
                   embed_files: embedFilesMode,
                 },
                 project_summary: project_summary ?? null,
                 recent_notes,
+                pending_total,
+                pending_offset,
+                pending_limit,
+                pending_truncated,
                 pending_changes,
                 items,
                 semantic,
@@ -2145,6 +2217,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (toolName === "get_brain_dump") {
+      const args = GetBrainDumpArgsSchema.parse(rawArgs);
       const recent = listRecentRequirementsStmt.all(5) as RequirementRow[];
       const items = recent.map((req) => {
         const changes = listChangeLogsForRequirementStmt.all(req.id, 20) as ChangeLogRow[];
@@ -2152,11 +2225,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       const project_summary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
       const recent_notes = listRecentNotesStmt.all(10) as MemoryItemRow[];
-      const pending_changes = listPendingChangesStmt.all() as Array<{
+      const pending_total = Number(
+        (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
+      );
+      const pending_offset = args.pending_offset;
+      const pending_limit = args.pending_limit;
+      const pending_truncated = pending_total > pending_offset + pending_limit;
+
+      const pending_changes = (listPendingChangesPageStmt.all(pending_limit, pending_offset) as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>;
+      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
 
       return {
         content: [
@@ -2166,18 +2246,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               {
                 ok: true,
                 generated_at: new Date().toISOString(),
-                 project_root: projectRoot,
-                 root_source: rootSource,
-                 db_path: dbPath,
-                 watcher_enabled: !!watcher,
-                 watcher_ready: watcherReady,
-                 embeddings: {
-                   enabled: embeddingsEnabled,
-                   model: embedModelName,
+                project_root: projectRoot,
+                root_source: rootSource,
+                db_path: dbPath,
+                watcher_enabled: !!watcher,
+                watcher_ready: watcherReady,
+                embeddings: {
+                  enabled: embeddingsEnabled,
+                  model: embedModelName,
                   embed_files: embedFilesMode,
                 },
                 project_summary: project_summary ?? null,
                 recent_notes,
+                pending_total,
+                pending_offset,
+                pending_limit,
+                pending_truncated,
                 pending_changes,
                 items,
               },
@@ -2190,17 +2274,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     if (toolName === "get_pending_changes") {
-      const pending = listPendingChangesStmt.all() as Array<{
+      const args = GetPendingChangesArgsSchema.parse(rawArgs);
+      const total = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
+      const offset = args.offset;
+      const limit = args.limit;
+      const truncated = total > offset + limit;
+
+      const pending = (listPendingChangesPageStmt.all(limit, offset) as Array<{
         file_path: string;
         last_event: string;
         updated_at: string;
-      }>;
+      }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, pending }, null, 2),
+            text: JSON.stringify({ ok: true, total, offset, limit, truncated, pending }, null, 2),
           },
         ],
       };

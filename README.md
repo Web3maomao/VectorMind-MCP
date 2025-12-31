@@ -50,11 +50,12 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 - 用途：返回最近 5 个需求，以及每个需求最近的改动意图（用于会话恢复）
 
 ### `bootstrap_context`
-- 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean }`
+- 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean, pending_offset?: number, pending_limit?: number }`
 - 用途：返回 brain dump + pending changes；如果传入 `query`，会额外返回本地记忆库的检索结果（推荐新会话开始就用它）
+- 说明：为避免某些客户端（如 Claude Code）因 tool output 过大报错，`pending_changes` 默认会分页返回；可用 `pending_offset/pending_limit` 翻页。
 
 ### `get_pending_changes`
-- 入参：`{}`
+- 入参：`{ offset?: number, limit?: number }`
 - 用途：返回本地“已发生变更但尚未被 sync_change_intent 确认”的文件列表（便于 AI 不漏同步）
 
 ### `query_codebase`
