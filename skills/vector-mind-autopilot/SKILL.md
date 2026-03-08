@@ -41,6 +41,8 @@ If you still cannot determine it confidently, ask the user for the project root 
 ### 2) On every new session (or when the user says “继续/恢复/接着做”)
 
 - Call `bootstrap_context({ project_root: <PROJECT_ROOT>, query: <the user's current goal>, top_k: 5 })` first.
+  - Prefer keeping tool output small by default: `pending_limit: 50`, `requirements_limit: 3`, `changes_limit: 5`, `notes_limit: 5`, `preview_chars: 200`.
+  - Avoid `include_content: true` unless you truly need full text (it increases tokens).
 - Use the returned `project_summary`, `recent_notes`, `pending_changes`, and semantic `items` to ground your plan and avoid “blind guessing”.
 - Do **not** paste raw JSON unless the user asks for it (summarize key facts instead).
 
@@ -61,16 +63,20 @@ If you still cannot determine it confidently, ask the user for the project root 
 - If the user asks “X 在哪里定义的/哪个文件负责 Y”: call `query_codebase({ project_root: <PROJECT_ROOT>, query: "X" })` instead of guessing paths.
 - If you need to recall prior context/notes/decisions/code/docs: call `semantic_search({ project_root: <PROJECT_ROOT>, query, top_k, kinds? })` instead of guessing.
   - Note: `semantic_search` works even when embeddings are off (uses local SQLite FTS/LIKE). Enable `VECTORMIND_EMBEDDINGS=on` if you want vector semantic recall.
+- If you truly need full text for a specific match/note/summary, call `read_memory_item({ project_root: <PROJECT_ROOT>, id, offset, limit })` to fetch it in chunks instead of setting `include_content: true`.
 
 ### 6) After major milestones (or before ending the session)
 
 - Call `upsert_project_summary({ project_root: <PROJECT_ROOT>, summary })` to keep a single, up-to-date project summary.
 - Call `add_note({ project_root: <PROJECT_ROOT>, title?, content, tags? })` for durable decisions/constraints/TODOs that should survive across sessions.
+- If the user confirms a requirement is finished, call `complete_requirement({ project_root: <PROJECT_ROOT> })` so it no longer shows as active.
+- If the user states a durable project convention (framework, build command, naming rules, output paths), call `upsert_convention({ project_root: <PROJECT_ROOT>, key, content, tags? })`.
 
 ## Output Policy (user-visible)
 
 - Don’t spam tool outputs. Summarize what matters (active requirement, pending changes, next steps).
 - Show raw JSON only when the user requests debugging/verification.
+- If debugging VectorMind behavior, prefer `get_activity_summary` first (small output), and only use `get_activity_log` with paging (and `verbose=true` only if necessary).
 
 ## Setup / Troubleshooting
 

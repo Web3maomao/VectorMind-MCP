@@ -26,6 +26,7 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 2) **准备开始写代码前**：AI 调用 `start_requirement(title, background)`  
 3) **每次改完并保存后**：AI 调用 `get_pending_changes()` 查看待同步文件，再调用 `sync_change_intent(intent, files)`（可省略 files 让服务端自动关联所有 pending）  
 4) **阶段性收口**（重要）：AI 在对话里写好总结，然后调用 `upsert_project_summary(summary)`/`add_note(...)` 持久化  
+5) **需求完成时**：AI 调用 `complete_requirement()` 把需求标记为 `completed`（避免一直显示“处理中”）  
 5) **需要找代码定义时**：AI 调用 `query_codebase(query)`（不要靠猜）  
 6) **需要按语义找上下文/代码/文档时**：AI 调用 `semantic_search(query, ...)`（不要靠猜）
 
@@ -37,8 +38,21 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 > `project_root` 既可以是目录，也可以是某个文件路径/`file://` URI（服务端会向上查找 `.git/`、`package.json`、`pyproject.toml` 等标记来推断项目根目录）。
 
 ### `start_requirement`
-- 入参：`{ title: string, background?: string }`
+- 入参：`{ title: string, background?: string, close_previous?: boolean }`
 - 用途：创建并激活一个需求（后续改动意图会自动关联到最新 `active` 需求）
+- 说明：默认 `close_previous=true`，会把之前所有 `active` 需求标记为 `completed`（符合“单一 active 需求”的工作流）
+
+### `complete_requirement`
+- 入参：`{ req_id?: number, all_active?: boolean }`
+- 用途：把某个需求（或当前 active 需求）标记为 `completed`，避免一直显示“处理中”
+
+### `read_memory_item`
+- 入参：`{ id: number, offset?: number, limit?: number }`
+- 用途：按 `id` 读取某条 `memory_items` 的全文内容（支持 offset/limit 分段），用于“需要时再取全文”，避免 `bootstrap_context/semantic_search` 每次都带大段文本导致 tokens 暴涨
+
+### `upsert_convention`
+- 入参：`{ key: string, content: string, tags?: string[] }`
+- 用途：保存/更新“项目约定/规范”（框架选型、build 命令、产物路径、命名规则等），并在新会话通过 `bootstrap_context/get_brain_dump` 自动带出（仅 preview）
 
 ### `sync_change_intent`
 - 入参：`{ intent: string, files?: string[], affected_files?: string[] }`
@@ -46,13 +60,16 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 - 说明：如果不传 `files`，服务端会自动把“最近未同步的文件变更（pending）”关联到本次意图；如果没有激活需求，会返回错误并提示先 `start_requirement`
 
 ### `get_brain_dump`
-- 入参：`{}`
-- 用途：返回最近 5 个需求，以及每个需求最近的改动意图（用于会话恢复）
+- 入参：`{ requirements_limit?: number, changes_limit?: number, notes_limit?: number, preview_chars?: number, include_content?: boolean, pending_offset?: number, pending_limit?: number }`
+- 用途：返回最近需求/改动意图 + 项目总结/笔记 + pending changes（用于会话恢复）
+- 说明：默认输出为 **compact**（返回 preview，不返回大段全文）；需要更长正文时：优先用 `read_memory_item` 按需取全文（分段），而不是在这里开全量 `include_content`
 
 ### `bootstrap_context`
-- 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean, pending_offset?: number, pending_limit?: number }`
+- 入参：`{ query?: string, top_k?: number, kinds?: string[], include_content?: boolean, preview_chars?: number, content_max_chars?: number, requirements_limit?: number, changes_limit?: number, notes_limit?: number, pending_offset?: number, pending_limit?: number }`
 - 用途：返回 brain dump + pending changes；如果传入 `query`，会额外返回本地记忆库的检索结果（推荐新会话开始就用它）
-- 说明：为避免某些客户端（如 Claude Code）因 tool output 过大报错，`pending_changes` 默认会分页返回；可用 `pending_offset/pending_limit` 翻页。
+- 说明：
+  - 为避免某些客户端（如 Claude Code）因 tool output 过大报错，`pending_changes` 默认会分页返回；可用 `pending_offset/pending_limit` 翻页。
+  - 默认输出为 **compact**（返回 preview，不返回大段全文）；需要全文时：优先用 `read_memory_item` 按需取（分段），而不是在这里打开 `include_content`
 
 ### `get_pending_changes`
 - 入参：`{ offset?: number, limit?: number }`
@@ -65,19 +82,25 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 ### `upsert_project_summary`
 - 入参：`{ summary: string }`
 - 用途：保存/更新“项目级上下文总结”（由 AI 在对话里写好再保存），用于跨会话快速恢复
+- 返回：默认仅返回 `{ id, updated_at }`（避免把长总结再回传一遍增加 tokens）
 
 ### `add_note`
 - 入参：`{ title?: string, content: string, tags?: string[] }`
 - 用途：保存一条“可持久化的项目笔记”（决策、约束、TODO、架构说明等）
 
 ### `semantic_search`
-- 入参：`{ query: string, top_k?: number, kinds?: string[], include_content?: boolean }`
+- 入参：`{ query: string, top_k?: number, kinds?: string[], include_content?: boolean, preview_chars?: number, content_max_chars?: number }`
 - 用途：对本地记忆库进行检索（覆盖需求/意图/笔记/项目总结/代码 chunk/文档 chunk）。如启用 embeddings，会优先走向量相似度；否则使用本地 FTS/LIKE。
+
+### `prune_index`
+- 入参：`{ dry_run?: boolean, prune_ignored_paths?: boolean, prune_minified_bundles?: boolean, max_files?: number, vacuum?: boolean }`
+- 用途：清理历史上误索引/噪音的 `code_chunk/doc_chunk` 与 `symbols`（例如构建产物目录、新增忽略规则后遗留内容）。默认 `dry_run=true` 只统计，不实际删除。
 
 ## 本地数据与监听
 
 - 数据库：默认使用 MCP `roots/list` 提供的 workspace root（否则回退到 `process.cwd()`，也可用 `VECTORMIND_ROOT` 强制指定）创建 `.vectormind/vectormind.db`（默认已在 `.gitignore` 中忽略整个 `.vectormind/` 目录）
-- 监听范围：默认监听 workspace root（同上）下文件变动（默认忽略 `.git/`、`node_modules/`（含子目录）、`.vs/`、`bin/`、`obj/`、`dist/`、`build/`、`out/`、数据库文件等常见噪音目录/产物）
+- 监听范围：默认监听 workspace root（同上）下文件变动（默认忽略 `.git/`、`node_modules/`（含子目录）、`.vs/`、`bin/`、`obj/`、`dist/`、`build/`、`out/`、`artifacts/`、`buildFiles/`、以及 `.turbo/`、`.nx/`、`.cache/`、`.parcel-cache/` 等常见噪音目录/产物）
+- 自动清理：启动时会自动删除“已忽略目录”与常见噪音文件名（如 lockfile、`.min.js/.bundle.js/.chunk.js`）下历史遗留的 `code_chunk/doc_chunk` 与 `symbols`，避免数据库持续膨胀影响召回效果。
 - 符号抽取：目前为轻量正则抽取（非 AST 解析），支持常见语言如 TS/JS、Python、Go、Rust、C/C++
 - 检索：默认使用本地 SQLite FTS（无需模型）；当你设置 `VECTORMIND_EMBEDDINGS=on` 才会启用向量化（`@xenova/transformers`），并优先用向量相似度做语义召回（首次启用可能下载模型权重，向量与数据都在本地）
 
@@ -86,6 +109,17 @@ VectorMind 通过本地文件监听 + SQLite 关系记忆，把“需求 → 改
 ## 检索/向量化配置（可选）
 
 - `VECTORMIND_ROOT=...`：强制指定“项目根目录”（当你的 MCP Client 无法提供 workspace roots 或启动目录不对时使用）
+- `VECTORMIND_PRETTY_JSON=1`：让 tool 输出使用缩进 JSON（仅用于调试；会增加 tokens，默认不建议开启）
+- `VECTORMIND_DEBUG_LOG=1`：开启 MCP 调试活动日志（索引了什么/检索了什么/同步了什么），并提供 `get_activity_summary/get_activity_log/clear_activity_log` 工具拉取/清空日志（默认关闭）
+- `VECTORMIND_DEBUG_LOG_MAX=200`：调试日志最大保留条数（默认 200）
+- `VECTORMIND_PENDING_FLUSH_MS=200`：pending 变更写入 SQLite 的缓冲/合并间隔（单位 ms；默认 200；设为 0 表示每次事件都立刻写入）
+- `VECTORMIND_PENDING_TTL_DAYS=30`：pending 记录的自动过期天数（默认 30；设为 0 表示不过期）
+- `VECTORMIND_PENDING_MAX=5000`：pending 表最大条目数（默认 5000；超过后会删除最旧记录以避免无限膨胀）
+- `VECTORMIND_PENDING_PRUNE_EVERY=500`：每累计多少条 pending 事件触发一次 prune（默认 500；越小越及时但更频繁做清理）
+- `VECTORMIND_INDEX_MAX_CODE_BYTES=400000`：单文件最大索引字节数（代码类，默认 400KB；超过会跳过索引，避免 bundle/产物膨胀）
+- `VECTORMIND_INDEX_MAX_DOC_BYTES=600000`：单文件最大索引字节数（文档/配置类，默认 600KB；超过会跳过索引）
+- `VECTORMIND_INDEX_SKIP_MINIFIED=1`：跳过疑似 minified/bundle 的 JS/CSS（默认开启；能显著减少构建产物噪音）
+- `VECTORMIND_INDEX_AUTO_PRUNE_IGNORED=1`：启动时自动清理“已被忽略目录”下历史遗留的 chunk/symbol 索引（默认开启）
 - `VECTORMIND_EMBEDDINGS=on|off`：是否启用向量化（默认 `off`；开启后会启动本地 embedding 模型，`semantic_search` 优先走向量相似度；关闭则走本地 FTS/LIKE，不会生成向量/启动模型）
 - `VECTORMIND_EMBED_FILES=all|changed|none`：控制是否向量化“代码/文档 chunk”（默认 `all`；`none` 只影响 chunk，仍会向量化需求/意图/笔记/总结；`changed` 仅在 change/manual 时向量化 chunk）
 - `VECTORMIND_EMBED_MODEL=...`：指定 embedding 模型（默认 `Xenova/all-MiniLM-L6-v2`）

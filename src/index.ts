@@ -62,11 +62,86 @@ type ExtractedSymbol = {
 };
 
 const SERVER_NAME = "vector-mind";
-const SERVER_VERSION = "1.0.10";
+const SERVER_VERSION = "1.0.19";
 
 type RootSource = "tool_arg" | "env" | "mcp_roots" | "cwd" | "fallback";
 
 const rootFromEnv = process.env.VECTORMIND_ROOT?.trim() ?? "";
+
+const prettyJsonOutput = ["1", "true", "on", "yes"].includes(
+  (process.env.VECTORMIND_PRETTY_JSON ?? "").trim().toLowerCase(),
+);
+
+const debugLogEnabled = ["1", "true", "on", "yes"].includes(
+  (process.env.VECTORMIND_DEBUG_LOG ?? "").trim().toLowerCase(),
+);
+const debugLogMaxEntries = (() => {
+  const raw = process.env.VECTORMIND_DEBUG_LOG_MAX?.trim();
+  if (!raw) return 200;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 200;
+  return Math.min(5000, n);
+})();
+
+const PENDING_FLUSH_MS = (() => {
+  const raw = process.env.VECTORMIND_PENDING_FLUSH_MS?.trim();
+  if (!raw) return 200;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 200;
+  return n;
+})();
+
+const PENDING_TTL_DAYS = (() => {
+  const raw = process.env.VECTORMIND_PENDING_TTL_DAYS?.trim();
+  if (!raw) return 30;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return 30;
+  return n;
+})();
+
+const PENDING_MAX_ENTRIES = (() => {
+  const raw = process.env.VECTORMIND_PENDING_MAX?.trim();
+  if (!raw) return 5000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 5000;
+  return n;
+})();
+
+const PENDING_PRUNE_EVERY = (() => {
+  const raw = process.env.VECTORMIND_PENDING_PRUNE_EVERY?.trim();
+  if (!raw) return 500;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 500;
+  return n;
+})();
+
+const INDEX_MAX_CODE_BYTES = (() => {
+  const raw = process.env.VECTORMIND_INDEX_MAX_CODE_BYTES?.trim();
+  if (!raw) return 400_000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 400_000;
+  return n;
+})();
+
+const INDEX_MAX_DOC_BYTES = (() => {
+  const raw = process.env.VECTORMIND_INDEX_MAX_DOC_BYTES?.trim();
+  if (!raw) return 600_000;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n <= 0) return 600_000;
+  return n;
+})();
+
+const INDEX_SKIP_MINIFIED = (() => {
+  const raw = (process.env.VECTORMIND_INDEX_SKIP_MINIFIED ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return ["1", "true", "on", "yes"].includes(raw);
+})();
+
+const INDEX_AUTO_PRUNE_IGNORED = (() => {
+  const raw = (process.env.VECTORMIND_INDEX_AUTO_PRUNE_IGNORED ?? "").trim().toLowerCase();
+  if (!raw) return true;
+  return ["1", "true", "on", "yes"].includes(raw);
+})();
 
 const ROOTS_LIST_TIMEOUT_MS = (() => {
   const raw = process.env.VECTORMIND_ROOTS_TIMEOUT_MS?.trim();
@@ -97,10 +172,19 @@ let initializationPromise: Promise<void> | null = null;
 let insertRequirementStmt: Database.Statement;
 let getActiveRequirementStmt: Database.Statement;
 let listRecentRequirementsStmt: Database.Statement;
+let completeAllActiveRequirementsStmt: Database.Statement;
+let completeRequirementByIdStmt: Database.Statement;
+let completeAllActiveRequirementMemoryItemsStmt: Database.Statement;
+let completeRequirementMemoryItemByReqIdStmt: Database.Statement;
 let listChangeLogsForRequirementStmt: Database.Statement;
 let insertChangeLogStmt: Database.Statement;
 let insertMemoryItemStmt: Database.Statement;
 let getMemoryItemByIdStmt: Database.Statement;
+let getRequirementMemoryItemIdStmt: Database.Statement;
+let getConventionByKeyStmt: Database.Statement;
+let insertConventionStmt: Database.Statement;
+let updateConventionByIdStmt: Database.Statement;
+let listConventionsStmt: Database.Statement;
 let upsertProjectSummaryStmt: Database.Statement;
 let getProjectSummaryStmt: Database.Statement;
 let listRecentNotesStmt: Database.Statement;
@@ -113,6 +197,8 @@ let listPendingChangesPageStmt: Database.Statement;
 let countPendingChangesStmt: Database.Statement;
 let deletePendingChangeStmt: Database.Statement;
 let deleteAllPendingChangesStmt: Database.Statement;
+let deleteOldPendingChangesStmt: Database.Statement | null = null;
+let deleteOldestPendingChangesStmt: Database.Statement | null = null;
 let deleteSymbolsForFileStmt: Database.Statement;
 let upsertSymbolStmt: Database.Statement;
 let searchSymbolsStmt: Database.Statement;
@@ -120,6 +206,110 @@ let searchSymbolsStmt: Database.Statement;
 let indexFileSymbolsTx:
   | ((filePath: string, symbols: ExtractedSymbol[]) => void)
   | null = null;
+
+type ActivityEvent = {
+  id: number;
+  ts: string;
+  type: string;
+  project_root: string;
+  data: Record<string, unknown>;
+};
+
+let activitySeq = 0;
+const activityLog: ActivityEvent[] = [];
+
+function sanitizeForLog(value: unknown, depth = 0): unknown {
+  if (depth > 4) return "[max-depth]";
+  if (value === null || value === undefined) return value;
+  if (typeof value === "string") {
+    return value.length > 500 ? `${value.slice(0, 500)}...` : value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (Array.isArray(value)) {
+    const sliced = value.slice(0, 20).map((v) => sanitizeForLog(v, depth + 1));
+    return value.length > 20 ? [...sliced, `[+${value.length - 20} more]`] : sliced;
+  }
+  if (typeof value === "object") {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).slice(0, 40);
+    const out: Record<string, unknown> = {};
+    for (const k of keys) out[k] = sanitizeForLog(obj[k], depth + 1);
+    if (Object.keys(obj).length > 40) out["__more_keys__"] = Object.keys(obj).length - 40;
+    return out;
+  }
+  try {
+    return String(value);
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function logActivity(type: string, data: Record<string, unknown>): void {
+  if (!debugLogEnabled) return;
+  activityLog.push({
+    id: ++activitySeq,
+    ts: new Date().toISOString(),
+    type,
+    project_root: projectRoot || "",
+    data: sanitizeForLog(data) as Record<string, unknown>,
+  });
+  while (activityLog.length > debugLogMaxEntries) activityLog.shift();
+}
+
+function snapshotActivityLog(opts: { sinceId: number; limit: number }): { events: ActivityEvent[]; last_id: number } {
+  const sinceId = Math.max(0, opts.sinceId);
+  const limit = Math.max(1, Math.min(500, opts.limit));
+  const lastId = activitySeq;
+  const events = activityLog.filter((e) => e.id > sinceId).slice(0, limit);
+  return { events, last_id: lastId };
+}
+
+function clearActivityLog(): void {
+  activityLog.length = 0;
+  activitySeq = 0;
+}
+
+function summarizeActivityEvent(e: ActivityEvent): string {
+  const d = e.data ?? {};
+  switch (e.type) {
+    case "index_file":
+      return `index ${String(d.file_path ?? "")} reason=${String(d.reason ?? "")} symbols=${String(
+        d.symbols ?? "",
+      )} chunks=${String(d.chunks ?? "")}`;
+    case "remove_file":
+      return `remove ${String(d.file_path ?? "")}`;
+    case "pending_flush":
+      return `pending_flush entries=${String(d.entries ?? "")}`;
+    case "pending_prune":
+      return `pending_prune ${String(d.before ?? "")}->${String(d.after ?? "")}`;
+    case "bootstrap_context":
+      return `bootstrap q=${String(d.query ?? "")} pending=${String(d.pending_returned ?? "")}/${String(
+        d.pending_total ?? "",
+      )} reqs=${String(d.requirements_returned ?? "")} semantic=${String(d.semantic_mode ?? "")}+${
+        String(d.semantic_matches ?? "")
+      }`;
+    case "get_brain_dump":
+      return `brain_dump pending=${String(d.pending_returned ?? "")}/${String(d.pending_total ?? "")} reqs=${String(
+        d.requirements_returned ?? "",
+      )} notes=${String(d.notes_returned ?? "")}`;
+    case "get_pending_changes":
+      return `pending_list returned=${String(d.returned ?? "")} total=${String(d.total ?? "")}`;
+    case "semantic_search":
+      return `semantic_search mode=${String(d.mode ?? "")} q=${String(d.query ?? "")} matches=${String(
+        d.matches ?? "",
+      )}`;
+    case "query_codebase":
+      return `query_codebase q=${String(d.query ?? "")} matches=${String(d.matches ?? "")}`;
+    case "start_requirement":
+      return `start_requirement #${String(d.req_id ?? "")} ${String(d.title ?? "")}`;
+    case "sync_change_intent":
+      return `sync_change_intent #${String(d.req_id ?? "")} files=${String(d.files_total ?? "")}`;
+    case "complete_requirement":
+      return `complete_requirement ${String(d.all_active ? "all_active" : d.req_id ?? "")}`;
+    default:
+      return e.type;
+  }
+}
 
 const FTS_TABLE_NAME = "memory_items_fts";
 let ftsAvailable = false;
@@ -317,6 +507,10 @@ const IGNORED_PATH_SEGMENTS = new Set(
     ".next",
     ".nuxt",
     ".svelte-kit",
+    ".turbo",
+    ".nx",
+    ".cache",
+    ".parcel-cache",
 
     // .NET / VS build artifacts
     "bin",
@@ -327,9 +521,11 @@ const IGNORED_PATH_SEGMENTS = new Set(
     // General build outputs
     "dist",
     "build",
+    "buildfiles",
     "out",
     "target",
     "coverage",
+    "artifacts",
 
     // Python caches/venvs
     "__pycache__",
@@ -381,10 +577,153 @@ function pruneIgnoredPendingChanges(): void {
   if (!db) return;
   try {
     if (!IGNORED_LIKE_PATTERNS.length) return;
-    const where = IGNORED_LIKE_PATTERNS.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+    const where = IGNORED_LIKE_PATTERNS
+      .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
+      .join(" OR ");
     db.prepare(`DELETE FROM pending_changes WHERE ${where}`).run(...IGNORED_LIKE_PATTERNS);
   } catch (err) {
     console.error("[vectormind] prune pending_changes failed:", err);
+  }
+}
+
+let pendingEventsSincePrune = 0;
+
+function prunePendingChanges(): void {
+  if (!db) return;
+  try {
+    const before = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
+    pruneIgnoredPendingChanges();
+
+    if (PENDING_TTL_DAYS > 0) {
+      deleteOldPendingChangesStmt?.run(`-${PENDING_TTL_DAYS} days`);
+    }
+
+    if (PENDING_MAX_ENTRIES > 0) {
+      const total = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
+      const overflow = total - PENDING_MAX_ENTRIES;
+      if (overflow > 0) {
+        deleteOldestPendingChangesStmt?.run(overflow);
+      }
+    }
+
+    const after = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
+    if (before !== after) {
+      logActivity("pending_prune", { before, after });
+    }
+  } catch (err) {
+    console.error("[vectormind] prune pending_changes failed:", err);
+  }
+}
+
+function pruneIgnoredIndexesByPathPatterns(): { chunks_deleted: number; symbols_deleted: number } {
+  if (!db) return { chunks_deleted: 0, symbols_deleted: 0 };
+  try {
+    if (!IGNORED_LIKE_PATTERNS.length) return { chunks_deleted: 0, symbols_deleted: 0 };
+    const where = IGNORED_LIKE_PATTERNS
+      .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
+      .join(" OR ");
+
+    const chunksDeleted = db
+      .prepare(
+        `DELETE FROM memory_items
+         WHERE file_path IS NOT NULL
+           AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+           AND (${where})`,
+      )
+      .run(...IGNORED_LIKE_PATTERNS).changes;
+
+    const symbolsDeleted = db
+      .prepare(
+        `DELETE FROM symbols
+         WHERE file_path IS NOT NULL
+           AND (${where})`,
+      )
+      .run(...IGNORED_LIKE_PATTERNS).changes;
+
+    if (chunksDeleted || symbolsDeleted) {
+      logActivity("index_prune", {
+        reason: "ignored_paths",
+        chunks_deleted: chunksDeleted,
+        symbols_deleted: symbolsDeleted,
+      });
+    }
+
+    return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
+  } catch (err) {
+    console.error("[vectormind] prune indexes failed:", err);
+    return { chunks_deleted: 0, symbols_deleted: 0 };
+  }
+}
+
+function pruneFilenameNoiseIndexes(): { chunks_deleted: number; symbols_deleted: number } {
+  if (!db) return { chunks_deleted: 0, symbols_deleted: 0 };
+
+  const suffixes = [
+    ".min.js",
+    ".min.css",
+    ".bundle.js",
+    ".bundle.css",
+    ".chunk.js",
+    ".chunk.css",
+  ];
+  const baseNames = [
+    "package-lock.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lockb",
+    "cargo.lock",
+    "composer.lock",
+  ];
+
+  try {
+    const suffixWhere = suffixes.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+    const baseWhere = baseNames.map(() => "LOWER(file_path) LIKE ?").join(" OR ");
+
+    const suffixArgs = suffixes.map((s) => `%${s}`);
+    const baseArgs = baseNames.map((n) => `%/${n}`);
+
+    const whereParts: string[] = [];
+    const args: string[] = [];
+    if (suffixWhere) {
+      whereParts.push(`(${suffixWhere})`);
+      args.push(...suffixArgs);
+    }
+    if (baseWhere) {
+      whereParts.push(`(${baseWhere})`);
+      args.push(...baseArgs);
+    }
+    if (!whereParts.length) return { chunks_deleted: 0, symbols_deleted: 0 };
+    const where = whereParts.join(" OR ");
+
+    const chunksDeleted = db
+      .prepare(
+        `DELETE FROM memory_items
+         WHERE file_path IS NOT NULL
+           AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+           AND (${where})`,
+      )
+      .run(...args).changes;
+
+    const symbolsDeleted = db
+      .prepare(
+        `DELETE FROM symbols
+         WHERE file_path IS NOT NULL
+           AND (${where})`,
+      )
+      .run(...args).changes;
+
+    if (chunksDeleted || symbolsDeleted) {
+      logActivity("index_prune", {
+        reason: "filename_noise",
+        chunks_deleted: chunksDeleted,
+        symbols_deleted: symbolsDeleted,
+      });
+    }
+
+    return { chunks_deleted: chunksDeleted, symbols_deleted: symbolsDeleted };
+  } catch (err) {
+    console.error("[vectormind] prune filename noise failed:", err);
+    return { chunks_deleted: 0, symbols_deleted: 0 };
   }
 }
 
@@ -409,6 +748,7 @@ function shouldIgnorePath(inputPath: string): boolean {
 }
 
 function isSymbolIndexableFile(filePath: string): boolean {
+  if (shouldIgnoreContentFile(filePath)) return false;
   const ext = path.extname(filePath).toLowerCase();
   const allowed = new Set([
     ".ts",
@@ -444,6 +784,50 @@ function shouldIgnoreContentFile(filePath: string): boolean {
   ]);
   if (ignoreNames.has(base)) return true;
   if (base.endsWith(".min.js") || base.endsWith(".min.css")) return true;
+  if (base.endsWith(".bundle.js") || base.endsWith(".bundle.css")) return true;
+  if (base.endsWith(".chunk.js") || base.endsWith(".chunk.css")) return true;
+  return false;
+}
+
+function looksLikeGeneratedFile(content: string): boolean {
+  const head = content.slice(0, 4000).toLowerCase();
+  if (head.includes("@generated")) return true;
+  if (head.includes("do not edit") && (head.includes("generated") || head.includes("auto-generated"))) {
+    return true;
+  }
+  if (head.includes("this file was generated") && head.includes("do not edit")) return true;
+  return false;
+}
+
+function looksLikeMinifiedBundle(content: string): boolean {
+  if (content.length < 30_000) return false;
+
+  let lines = 1;
+  let currentLen = 0;
+  let maxLineLen = 0;
+  let longLines = 0;
+
+  for (let i = 0; i < content.length; i++) {
+    const code = content.charCodeAt(i);
+    if (code === 10 /* \\n */) {
+      if (currentLen > maxLineLen) maxLineLen = currentLen;
+      if (currentLen >= 800) longLines += 1;
+      currentLen = 0;
+      lines += 1;
+      continue;
+    }
+    currentLen += 1;
+  }
+  if (currentLen > maxLineLen) maxLineLen = currentLen;
+  if (currentLen >= 800) longLines += 1;
+
+  const avgLineLen = content.length / Math.max(1, lines);
+
+  if (lines <= 2 && maxLineLen >= 2000) return true;
+  if (maxLineLen >= 6000) return true;
+  if (avgLineLen >= 900) return true;
+  if (lines <= 10 && longLines >= Math.ceil(lines * 0.6)) return true;
+
   return false;
 }
 
@@ -695,9 +1079,9 @@ function indexFileContentChunks(
   absPath: string,
   content: string,
   reason: IndexReason,
-): void {
+): number {
   const kind = getContentChunkKind(absPath);
-  if (!kind) return;
+  if (!kind) return 0;
 
   const opts =
     kind === "code_chunk"
@@ -735,20 +1119,59 @@ function indexFileContentChunks(
   } catch (err) {
     console.error("[vectormind] failed to index file chunks:", dbFilePath, err);
   }
+  return chunks.length;
 }
 
 type PendingChangeEvent = "add" | "change" | "unlink";
+
+const pendingChangeBuffer = new Map<string, PendingChangeEvent>();
+let pendingChangeFlushTimer: NodeJS.Timeout | null = null;
+
+function flushPendingChangeBuffer(): void {
+  if (!db) return;
+  if (pendingChangeFlushTimer) {
+    clearTimeout(pendingChangeFlushTimer);
+    pendingChangeFlushTimer = null;
+  }
+  if (!pendingChangeBuffer.size) return;
+  const entries = Array.from(pendingChangeBuffer.entries());
+  pendingChangeBuffer.clear();
+
+  try {
+    const tx = db.transaction(() => {
+      for (const [filePath, event] of entries) {
+        upsertPendingChangeStmt.run(filePath, event);
+      }
+    });
+    tx();
+  } catch (err) {
+    console.error("[vectormind] failed to flush pending change buffer:", err);
+  }
+
+  logActivity("pending_flush", {
+    entries: entries.length,
+    sample: entries.slice(0, 10).map(([file_path, last_event]) => ({ file_path, last_event })),
+  });
+
+  pendingEventsSincePrune += entries.length;
+  if (pendingEventsSincePrune >= PENDING_PRUNE_EVERY) {
+    pendingEventsSincePrune = 0;
+    prunePendingChanges();
+  }
+}
 
 function recordPendingChange(absPath: string, event: PendingChangeEvent): void {
   if (shouldIgnorePath(absPath)) return;
   const track = isSymbolIndexableFile(absPath) || isContentIndexableFile(absPath);
   if (!track) return;
   const filePath = normalizeToDbPath(absPath);
-  try {
-    upsertPendingChangeStmt.run(filePath, event);
-  } catch (err) {
-    console.error("[vectormind] failed to record pending change:", filePath, err);
+  pendingChangeBuffer.set(filePath, event);
+  if (pendingChangeFlushTimer) return;
+  if (PENDING_FLUSH_MS === 0) {
+    flushPendingChangeBuffer();
+    return;
   }
+  pendingChangeFlushTimer = setTimeout(flushPendingChangeBuffer, PENDING_FLUSH_MS);
 }
 
 function indexFile(absPath: string, reason: IndexReason): void {
@@ -757,6 +1180,9 @@ function indexFile(absPath: string, reason: IndexReason): void {
   const indexContent = isContentIndexableFile(absPath);
   if (!indexSymbols && !indexContent) return;
 
+  const kind = getContentChunkKind(absPath);
+  if (!kind) return;
+
   let stat: fs.Stats;
   try {
     stat = fs.statSync(absPath);
@@ -764,7 +1190,8 @@ function indexFile(absPath: string, reason: IndexReason): void {
     return;
   }
   if (!stat.isFile()) return;
-  if (stat.size > 1_000_000) return;
+  const maxBytes = kind === "code_chunk" ? INDEX_MAX_CODE_BYTES : INDEX_MAX_DOC_BYTES;
+  if (maxBytes > 0 && stat.size > maxBytes) return;
 
   let content: string;
   try {
@@ -774,9 +1201,27 @@ function indexFile(absPath: string, reason: IndexReason): void {
   }
   if (content.includes("\u0000")) return;
 
+  const ext = path.extname(absPath).toLowerCase();
   const filePath = normalizeToDbPath(absPath);
+  if (
+    INDEX_SKIP_MINIFIED &&
+    kind === "code_chunk" &&
+    (ext === ".js" || ext === ".mjs" || ext === ".cjs" || ext === ".css") &&
+    looksLikeMinifiedBundle(content)
+  ) {
+    logActivity("index_skip", { file_path: filePath, reason: "minified_bundle", bytes: stat.size });
+    return;
+  }
+  if (kind === "code_chunk" && stat.size >= 20_000 && looksLikeGeneratedFile(content)) {
+    logActivity("index_skip", { file_path: filePath, reason: "generated_file", bytes: stat.size });
+    return;
+  }
+
+  let symbolCount = 0;
+  let chunkCount = 0;
   if (indexSymbols) {
     const symbols = extractSymbols(absPath, content);
+    symbolCount = symbols.length;
     try {
       indexFileSymbolsTx?.(filePath, symbols);
     } catch (err) {
@@ -784,8 +1229,16 @@ function indexFile(absPath: string, reason: IndexReason): void {
     }
   }
   if (indexContent) {
-    indexFileContentChunks(filePath, absPath, content, reason);
+    chunkCount = indexFileContentChunks(filePath, absPath, content, reason);
   }
+
+  logActivity("index_file", {
+    file_path: filePath,
+    reason,
+    symbols: symbolCount,
+    chunks: chunkCount,
+    bytes: stat.size,
+  });
 }
 
 function removeFileIndexes(absPath: string): void {
@@ -801,6 +1254,7 @@ function removeFileIndexes(absPath: string): void {
   } catch (err) {
     console.error("[vectormind] failed to remove file chunks:", filePath, err);
   }
+  logActivity("remove_file", { file_path: filePath });
 }
 
 const ProjectRootArgSchema = z.object({
@@ -811,6 +1265,7 @@ const StartRequirementArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     title: z.string().min(1),
     background: z.string().optional().default(""),
+    close_previous: z.boolean().optional().default(true),
   }),
 );
 
@@ -842,12 +1297,52 @@ const AddNoteArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const DEFAULT_PENDING_LIMIT = 200;
+const PruneIndexArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    dry_run: z.boolean().optional().default(true),
+    prune_ignored_paths: z.boolean().optional().default(true),
+    prune_minified_bundles: z.boolean().optional().default(false),
+    max_files: z.number().int().min(1).max(50_000).optional().default(2000),
+    vacuum: z.boolean().optional().default(false),
+  }),
+);
+
+const UpsertConventionArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    key: z.string().min(1),
+    content: z.string().min(1),
+    tags: z.array(z.string().min(1)).optional(),
+  }),
+);
+
+const DEFAULT_PENDING_LIMIT = 50;
 const MAX_PENDING_LIMIT = 2000;
 
 const PendingPagingSchema = z.object({
   pending_offset: z.number().int().min(0).optional().default(0),
   pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
+});
+
+const DEFAULT_PREVIEW_CHARS = 200;
+const PreviewSchema = z.object({
+  preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+});
+
+const DEFAULT_CONTENT_MAX_CHARS = 2000;
+const ContentMaxSchema = z.object({
+  content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+});
+
+const DEFAULT_RECENT_REQUIREMENTS = 3;
+const DEFAULT_RECENT_CHANGES_PER_REQ = 5;
+const DEFAULT_RECENT_NOTES = 5;
+const DEFAULT_CONVENTIONS_LIMIT = 20;
+
+const BrainDumpLimitsSchema = z.object({
+  requirements_limit: z.number().int().min(1).max(20).optional().default(DEFAULT_RECENT_REQUIREMENTS),
+  changes_limit: z.number().int().min(1).max(100).optional().default(DEFAULT_RECENT_CHANGES_PER_REQ),
+  notes_limit: z.number().int().min(0).max(50).optional().default(DEFAULT_RECENT_NOTES),
+  conventions_limit: z.number().int().min(0).max(200).optional().default(DEFAULT_CONVENTIONS_LIMIT),
 });
 
 const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
@@ -857,29 +1352,74 @@ const GetPendingChangesArgsSchema = ProjectRootArgSchema.merge(
   }),
 );
 
-const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema);
+const CompleteRequirementArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    req_id: z.number().int().positive().optional(),
+    all_active: z.boolean().optional().default(false),
+  }),
+);
+
+const GetActivityLogArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    since_id: z.number().int().min(0).optional().default(0),
+    limit: z.number().int().min(1).max(500).optional().default(30),
+    verbose: z.boolean().optional().default(false),
+  }),
+);
+
+const GetActivitySummaryArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    since_id: z.number().int().min(0).optional().default(0),
+    max_files: z.number().int().min(0).max(200).optional().default(20),
+  }),
+);
+
+const ClearActivityLogArgsSchema = ProjectRootArgSchema;
+
+const GetBrainDumpArgsSchema = ProjectRootArgSchema.merge(PendingPagingSchema)
+  .merge(PreviewSchema)
+  .merge(ContentMaxSchema)
+  .merge(BrainDumpLimitsSchema)
+  .merge(
+    z.object({
+      include_content: z.boolean().optional().default(false),
+    }),
+  );
 
 const BootstrapContextArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     query: z.string().optional(),
-    top_k: z.number().int().min(1).max(50).optional().default(10),
+    top_k: z.number().int().min(1).max(50).optional().default(5),
     kinds: z.array(z.string().min(1)).optional(),
     include_content: z.boolean().optional().default(false),
     pending_offset: z.number().int().min(0).optional().default(0),
     pending_limit: z.number().int().min(1).max(MAX_PENDING_LIMIT).optional().default(DEFAULT_PENDING_LIMIT),
-  }),
+  })
+    .merge(PreviewSchema)
+    .merge(ContentMaxSchema)
+    .merge(BrainDumpLimitsSchema),
 );
 
 const SemanticSearchArgsSchema = ProjectRootArgSchema.merge(
   z.object({
     query: z.string().min(1),
-    top_k: z.number().int().min(1).max(50).optional().default(10),
+    top_k: z.number().int().min(1).max(50).optional().default(8),
     kinds: z.array(z.string().min(1)).optional(),
     include_content: z.boolean().optional().default(false),
+    preview_chars: z.number().int().min(50).max(10_000).optional().default(DEFAULT_PREVIEW_CHARS),
+    content_max_chars: z.number().int().min(0).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
   }),
 );
 
 const ProjectRootOnlyArgsSchema = ProjectRootArgSchema;
+
+const ReadMemoryItemArgsSchema = ProjectRootArgSchema.merge(
+  z.object({
+    id: z.number().int().positive(),
+    offset: z.number().int().min(0).optional().default(0),
+    limit: z.number().int().min(1).max(200_000).optional().default(DEFAULT_CONTENT_MAX_CHARS),
+  }),
+);
 
 function escapeLike(pattern: string): string {
   return pattern.replace(/[\\\\%_]/g, (m) => `\\${m}`);
@@ -896,6 +1436,20 @@ function safeJson(value: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+function toolJson(value: unknown): string {
+  return JSON.stringify(value, null, prettyJsonOutput ? 2 : undefined);
+}
+
+function sliceTextForOutput(
+  input: string,
+  maxChars: number,
+): { text: string; truncated: boolean; total_chars: number } {
+  const total = input.length;
+  if (maxChars <= 0) return { text: input, truncated: false, total_chars: total };
+  if (total <= maxChars) return { text: input, truncated: false, total_chars: total };
+  return { text: input.slice(0, maxChars), truncated: true, total_chars: total };
 }
 
 const embeddingsEnabled = !["0", "false", "off", "disabled"].includes(
@@ -1072,6 +1626,7 @@ type SemanticSearchMatch = {
     req_id: number | null;
     preview: string;
     content?: string;
+    content_truncated?: boolean;
     metadata_json: string | null;
     updated_at: string;
   };
@@ -1089,10 +1644,12 @@ type SemanticSearchOpts = {
   topK: number;
   kinds: string[] | null;
   includeContent: boolean;
+  previewChars: number;
+  contentMaxChars: number;
 };
 
-function makePreviewText(content: string): string {
-  const max = 400;
+function makePreviewText(content: string, max: number): string {
+  if (max <= 0) return "";
   if (content.length <= max) return content;
   return `${content.slice(0, max)}...`;
 }
@@ -1101,8 +1658,11 @@ function toSemanticMatch(
   row: MemoryItemSearchRow,
   score: number,
   includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
 ): SemanticSearchMatch {
-  const preview = makePreviewText(row.content);
+  const preview = makePreviewText(row.content, previewChars);
+  const contentSlice = includeContent ? sliceTextForOutput(row.content, contentMaxChars) : null;
   return {
     score,
     item: {
@@ -1114,11 +1674,124 @@ function toSemanticMatch(
       end_line: row.end_line,
       req_id: row.req_id,
       preview,
-      content: includeContent ? row.content : undefined,
+      content: contentSlice ? contentSlice.text : undefined,
+      content_truncated: contentSlice ? contentSlice.truncated : undefined,
       metadata_json: row.metadata_json,
       updated_at: row.updated_at,
     },
   };
+}
+
+function toMemoryItemPreview(
+  row: MemoryItemRow,
+  includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
+): {
+  id: number;
+  kind: string;
+  title: string | null;
+  file_path: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  req_id: number | null;
+  preview: string;
+  content?: string;
+  content_truncated?: boolean;
+  metadata_json: string | null;
+  updated_at: string;
+} {
+  const preview = makePreviewText(row.content, previewChars);
+  const contentSlice = includeContent ? sliceTextForOutput(row.content, contentMaxChars) : null;
+  return {
+    id: row.id,
+    kind: row.kind,
+    title: row.title,
+    file_path: row.file_path,
+    start_line: row.start_line,
+    end_line: row.end_line,
+    req_id: row.req_id,
+    preview,
+    content: contentSlice ? contentSlice.text : undefined,
+    content_truncated: contentSlice ? contentSlice.truncated : undefined,
+    metadata_json: row.metadata_json,
+    updated_at: row.updated_at,
+  };
+}
+
+function toRequirementPreview(
+  req: RequirementRow,
+  includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
+): {
+  id: number;
+  title: string;
+  status: string;
+  created_at: string;
+  memory_item_id: number | null;
+  context_preview: string | null;
+  context_data?: string | null;
+  context_truncated?: boolean;
+} {
+  const context = req.context_data ?? null;
+  const contextPreview = context ? makePreviewText(context, previewChars) : null;
+  const contextSlice = includeContent && context ? sliceTextForOutput(context, contentMaxChars) : null;
+  const memRow = (getRequirementMemoryItemIdStmt.get(req.id) as { id: number } | undefined) ?? undefined;
+  return {
+    id: req.id,
+    title: req.title,
+    status: req.status,
+    created_at: req.created_at,
+    memory_item_id: memRow?.id ?? null,
+    context_preview: contextPreview,
+    context_data: contextSlice ? contextSlice.text : undefined,
+    context_truncated: contextSlice ? contextSlice.truncated : undefined,
+  };
+}
+
+function toChangeLogPreview(
+  change: ChangeLogRow,
+  includeContent: boolean,
+  previewChars: number,
+  contentMaxChars: number,
+): {
+  id: number;
+  file_path: string;
+  timestamp: string;
+  intent_preview: string;
+  intent_summary?: string;
+  intent_truncated?: boolean;
+} {
+  const preview = makePreviewText(change.intent_summary, previewChars);
+  const intentSlice = includeContent ? sliceTextForOutput(change.intent_summary, contentMaxChars) : null;
+  return {
+    id: change.id,
+    file_path: change.file_path,
+    timestamp: change.timestamp,
+    intent_preview: preview,
+    intent_summary: intentSlice ? intentSlice.text : undefined,
+    intent_truncated: intentSlice ? intentSlice.truncated : undefined,
+  };
+}
+
+function completeRequirementMemoryItemsByReqId(reqId: number): void {
+  try {
+    completeRequirementMemoryItemByReqIdStmt.run(safeJson({ status: "completed" }), reqId);
+  } catch (err) {
+    console.error("[vectormind] failed to complete requirement memory item:", err);
+  }
+}
+
+function completeAllActiveRequirementMemoryItems(): void {
+  try {
+    completeAllActiveRequirementMemoryItemsStmt.run(
+      safeJson({ status: "completed" }),
+      safeJson({ status: "active" }),
+    );
+  } catch (err) {
+    console.error("[vectormind] failed to complete all active requirement memory items:", err);
+  }
 }
 
 async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<SemanticSearchResult> {
@@ -1175,7 +1848,7 @@ async function semanticSearchInternal(opts: SemanticSearchOpts): Promise<Semanti
     .map((t) => {
       const item = getMemoryItemByIdStmt.get(t.memory_id) as MemoryItemRow | undefined;
       if (!item) return null;
-      return toSemanticMatch(item, t.score, opts.includeContent);
+      return toSemanticMatch(item, t.score, opts.includeContent, opts.previewChars, opts.contentMaxChars);
     })
     .filter(Boolean) as Array<{
     score: number;
@@ -1268,7 +1941,7 @@ function ftsSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   })();
 
   const matches = rows
-    .map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent))
+    .map((r) => toSemanticMatch(r, -Number(r.rank), opts.includeContent, opts.previewChars, opts.contentMaxChars))
     .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
     .slice(0, opts.topK);
   return { query: q, top_k: opts.topK, mode: "fts", matches };
@@ -1343,7 +2016,7 @@ function likeSearchInternal(opts: SemanticSearchOpts): SemanticSearchResult {
   })();
 
   const matches = rows
-    .map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent))
+    .map((r) => toSemanticMatch(r, Number(r.score), opts.includeContent, opts.previewChars, opts.contentMaxChars))
     .filter((m) => !shouldIgnoreDbFilePath(m.item.file_path))
     .slice(0, opts.topK);
   return { query: q, top_k: opts.topK, mode: "like", matches };
@@ -1380,9 +2053,14 @@ const server = new Server(
       "",
       "Required workflow:",
       "- On every new conversation/session: call bootstrap_context({ query: <current goal> }) first (or at least get_brain_dump()) to restore context and retrieve relevant matches from the local memory store (vector if enabled; otherwise FTS/LIKE).",
+      "  - Output is compact by default. Use include_content=true only when you truly need full text (it increases tokens).",
+      "  - Tune output size with: requirements_limit/changes_limit/notes_limit, preview_chars, pending_limit/pending_offset.",
+      "  - Prefer read_memory_item(id, offset, limit) to fetch full text on demand instead of returning large content in other tool outputs.",
       "- BEFORE editing code: call start_requirement(title, background) to set the active requirement.",
       "- AFTER editing + saving: call get_pending_changes() to see unsynced files, then call sync_change_intent(intent, files). (You can omit files to auto-link all pending changes.)",
       "- After major milestones/decisions: call upsert_project_summary(summary) and/or add_note(...) to persist durable context locally.",
+      "- If the user states a durable project convention (build commands, frameworks, naming rules, output paths): call upsert_convention(key, content, tags) so it is applied in future sessions.",
+      "- When you need full text for a specific note/summary/match: call read_memory_item(id, offset, limit) and page through it.",
       "- When asked to locate code (class/function/type): call query_codebase(query) instead of guessing.",
       "- When you need to recall relevant context from history/code/docs: call semantic_search(query, ...) instead of guessing.",
       "",
@@ -1596,6 +2274,9 @@ function initDatabase(): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_project_summary
       ON memory_items(kind) WHERE kind = 'project_summary';
 
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_items_convention_key
+      ON memory_items(kind, title) WHERE kind = 'convention';
+
     CREATE INDEX IF NOT EXISTS idx_memory_items_kind_updated_at
       ON memory_items(kind, updated_at DESC);
 
@@ -1633,6 +2314,12 @@ function initDatabase(): void {
   insertRequirementStmt = db.prepare(
     `INSERT INTO requirements (title, context_data, status) VALUES (?, ?, 'active')`,
   );
+  completeAllActiveRequirementsStmt = db.prepare(
+    `UPDATE requirements SET status = 'completed' WHERE status = 'active'`,
+  );
+  completeRequirementByIdStmt = db.prepare(
+    `UPDATE requirements SET status = 'completed' WHERE id = ?`,
+  );
   getActiveRequirementStmt = db.prepare(
     `SELECT id, title, status, context_data, created_at
      FROM requirements
@@ -1645,6 +2332,18 @@ function initDatabase(): void {
      FROM requirements
      ORDER BY created_at DESC, id DESC
      LIMIT ?`,
+  );
+  completeAllActiveRequirementMemoryItemsStmt = db.prepare(
+    `UPDATE memory_items
+     SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE kind = 'requirement'
+       AND metadata_json = ?`,
+  );
+  completeRequirementMemoryItemByReqIdStmt = db.prepare(
+    `UPDATE memory_items
+     SET metadata_json = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE kind = 'requirement'
+       AND req_id = ?`,
   );
   listChangeLogsForRequirementStmt = db.prepare(
     `SELECT id, req_id, file_path, intent_summary, timestamp
@@ -1659,14 +2358,44 @@ function initDatabase(): void {
 
   insertMemoryItemStmt = db.prepare(
     `INSERT INTO memory_items
-      (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash)
+       (kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash)
      VALUES
-      (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   getMemoryItemByIdStmt = db.prepare(
     `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
      FROM memory_items
      WHERE id = ?`,
+  );
+  getConventionByKeyStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'convention' AND title = ?
+     ORDER BY updated_at DESC, id DESC
+     LIMIT 1`,
+  );
+  insertConventionStmt = db.prepare(
+    `INSERT INTO memory_items (kind, title, content, metadata_json, content_hash)
+     VALUES ('convention', ?, ?, ?, ?)`,
+  );
+  updateConventionByIdStmt = db.prepare(
+    `UPDATE memory_items
+     SET content = ?, metadata_json = ?, content_hash = ?, updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`,
+  );
+  listConventionsStmt = db.prepare(
+    `SELECT id, kind, title, content, file_path, start_line, end_line, req_id, metadata_json, content_hash, created_at, updated_at
+     FROM memory_items
+     WHERE kind = 'convention'
+     ORDER BY updated_at DESC, id DESC
+     LIMIT ?`,
+  );
+  getRequirementMemoryItemIdStmt = db.prepare(
+    `SELECT id
+     FROM memory_items
+     WHERE kind = 'requirement' AND req_id = ?
+     ORDER BY id DESC
+     LIMIT 1`,
   );
   upsertProjectSummaryStmt = db.prepare(
     `INSERT INTO memory_items (kind, title, content, metadata_json, content_hash)
@@ -1735,6 +2464,17 @@ function initDatabase(): void {
     `DELETE FROM pending_changes WHERE file_path = ?`,
   );
   deleteAllPendingChangesStmt = db.prepare(`DELETE FROM pending_changes`);
+  deleteOldPendingChangesStmt = db.prepare(
+    `DELETE FROM pending_changes WHERE updated_at < datetime('now', ?)`,
+  );
+  deleteOldestPendingChangesStmt = db.prepare(
+    `DELETE FROM pending_changes
+     WHERE file_path IN (
+       SELECT file_path FROM pending_changes
+       ORDER BY updated_at ASC
+       LIMIT ?
+     )`,
+  );
 
   deleteSymbolsForFileStmt = db.prepare(
     `DELETE FROM symbols WHERE file_path = ?`,
@@ -1765,7 +2505,16 @@ function initDatabase(): void {
   });
 
   // Clean up noisy pending changes recorded by older versions (build artifacts, node_modules, etc).
-  pruneIgnoredPendingChanges();
+  prunePendingChanges();
+
+  // Clean up noisy indexes recorded by older versions (build artifacts, etc).
+  if (INDEX_AUTO_PRUNE_IGNORED) {
+    pruneIgnoredIndexesByPathPatterns();
+  }
+
+  // Clean up common "file name noise" recorded by older versions.
+  // (These files are ignored by current index rules; keep the DB consistent automatically.)
+  pruneFilenameNoiseIndexes();
 }
 
 function initWatcher(): void {
@@ -1852,6 +2601,12 @@ async function switchProjectRootIfNeeded(next: { root: string; source: RootSourc
   if (same) return;
 
   try {
+    flushPendingChangeBuffer();
+  } catch (err) {
+    console.error("[vectormind] pending buffer flush error:", err);
+  }
+
+  try {
     await watcher?.close();
   } catch (err) {
     console.error("[vectormind] watcher close error:", err);
@@ -1924,6 +2679,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: toJsonSchemaCompat(GetPendingChangesArgsSchema),
       },
       {
+        name: "complete_requirement",
+        description:
+          "Mark a requirement as completed (by id or the current active one). Use this when work for a requirement is done so it no longer shows as active.",
+        inputSchema: toJsonSchemaCompat(CompleteRequirementArgsSchema),
+      },
+      {
+        name: "read_memory_item",
+        description:
+          "Read a memory item by id. Use this to fetch full text only when needed (bootstrap_context/get_brain_dump/semantic_search return previews by default). Supports offset/limit chunking to avoid huge tool outputs.",
+        inputSchema: toJsonSchemaCompat(ReadMemoryItemArgsSchema),
+      },
+      {
+        name: "get_activity_log",
+        description:
+          "Get recent debug activity (indexing/search/pending) for troubleshooting. Enable logging with VECTORMIND_DEBUG_LOG=1. Use since_id/limit to page.",
+        inputSchema: toJsonSchemaCompat(GetActivityLogArgsSchema),
+      },
+      {
+        name: "get_activity_summary",
+        description:
+          "Get a compact summary of recent debug activity (counts + small samples). Enable logging with VECTORMIND_DEBUG_LOG=1. Use since_id to get incremental summaries.",
+        inputSchema: toJsonSchemaCompat(GetActivitySummaryArgsSchema),
+      },
+      {
+        name: "clear_activity_log",
+        description:
+          "Clear the in-memory debug activity log. Enable logging with VECTORMIND_DEBUG_LOG=1.",
+        inputSchema: toJsonSchemaCompat(ClearActivityLogArgsSchema),
+      },
+      {
         name: "query_codebase",
         description:
           "Search the symbol index for class/function/type names (or substrings) to locate definitions by file path and signature. Use this when you need to find code—do not guess locations.",
@@ -1942,10 +2727,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: toJsonSchemaCompat(AddNoteArgsSchema),
       },
       {
+        name: "upsert_convention",
+        description:
+          "Save/update a project convention (framework choice, build command, naming rules, etc). Conventions are durable and should be applied automatically in future sessions.",
+        inputSchema: toJsonSchemaCompat(UpsertConventionArgsSchema),
+      },
+      {
         name: "semantic_search",
         description:
           "Semantic search across the local memory store (requirements, change intents, notes, project summary, and indexed code/doc chunks). Use this to retrieve relevant context instead of guessing.",
         inputSchema: toJsonSchemaCompat(SemanticSearchArgsSchema),
+      },
+      {
+        name: "prune_index",
+        description:
+          "Prune noisy auto-indexed items (code_chunk/doc_chunk + symbols). Useful after tightening ignore rules to shrink the index and improve search relevance.",
+        inputSchema: toJsonSchemaCompat(PruneIndexArgsSchema),
       },
     ],
   };
@@ -1960,6 +2757,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "start_requirement") {
       const args = StartRequirementArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+
+      if (args.close_previous) {
+        try {
+          completeAllActiveRequirementsStmt.run();
+          completeAllActiveRequirementMemoryItems();
+        } catch (err) {
+          console.error("[vectormind] failed to close previous active requirements:", err);
+        }
+      }
+
       const info = insertRequirementStmt.run(args.title, args.background || null);
       const id = Number(info.lastInsertRowid);
 
@@ -1979,15 +2787,174 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const memory_id = Number(memoryInfo.lastInsertRowid);
       enqueueEmbedding(memory_id);
 
+      logActivity("start_requirement", {
+        req_id: id,
+        title: args.title,
+        closed_previous: args.close_previous,
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              { ok: true, requirement: { id, title: args.title }, memory_item: { id: memory_id } },
-              null,
-              2,
-            ),
+            text: toolJson({
+              ok: true,
+              requirement: { id, title: args.title },
+              memory_item: { id: memory_id },
+              closed_previous: args.close_previous,
+            }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "prune_index") {
+      const args = PruneIndexArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+
+      const result = {
+        ok: true as const,
+        dry_run: args.dry_run,
+        config: {
+          index_max_code_bytes: INDEX_MAX_CODE_BYTES,
+          index_max_doc_bytes: INDEX_MAX_DOC_BYTES,
+          index_skip_minified: INDEX_SKIP_MINIFIED,
+          index_auto_prune_ignored: INDEX_AUTO_PRUNE_IGNORED,
+        },
+        pruned: {
+          ignored_paths: { chunks_deleted: 0, symbols_deleted: 0 },
+          minified_bundles: { files_matched: 0, chunks_deleted: 0, symbols_deleted: 0 },
+        },
+      };
+
+      if (args.prune_ignored_paths) {
+        if (!IGNORED_LIKE_PATTERNS.length) {
+          result.pruned.ignored_paths = { chunks_deleted: 0, symbols_deleted: 0 };
+        } else if (args.dry_run) {
+          const where = IGNORED_LIKE_PATTERNS
+            .map(() => "LOWER(REPLACE(file_path, '\\\\', '/')) LIKE ?")
+            .join(" OR ");
+          const chunksWould = Number(
+            (
+              db
+                .prepare(
+                  `SELECT COUNT(1) AS c
+                   FROM memory_items
+                   WHERE file_path IS NOT NULL
+                     AND (kind = 'code_chunk' OR kind = 'doc_chunk')
+                     AND (${where})`,
+                )
+                .get(...IGNORED_LIKE_PATTERNS) as { c: number } | undefined
+            )?.c ?? 0,
+          );
+          const symbolsWould = Number(
+            (
+              db
+                .prepare(
+                  `SELECT COUNT(1) AS c
+                   FROM symbols
+                   WHERE file_path IS NOT NULL
+                     AND (${where})`,
+                )
+                .get(...IGNORED_LIKE_PATTERNS) as { c: number } | undefined
+            )?.c ?? 0,
+          );
+          result.pruned.ignored_paths = { chunks_deleted: chunksWould, symbols_deleted: symbolsWould };
+        } else {
+          result.pruned.ignored_paths = pruneIgnoredIndexesByPathPatterns();
+        }
+      }
+
+      if (args.prune_minified_bundles) {
+        const maxFiles = args.max_files;
+        const candidates = db
+          .prepare(
+            `SELECT file_path, content
+             FROM memory_items
+             WHERE kind = 'code_chunk'
+               AND file_path IS NOT NULL
+               AND (
+                 LOWER(file_path) LIKE '%.js'
+                 OR LOWER(file_path) LIKE '%.mjs'
+                 OR LOWER(file_path) LIKE '%.cjs'
+                 OR LOWER(file_path) LIKE '%.css'
+               )
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?`,
+          )
+          .all(Math.min(50_000, maxFiles * 5)) as Array<{ file_path: string; content: string }>;
+
+        const matched = new Set<string>();
+        for (const row of candidates) {
+          if (matched.size >= maxFiles) break;
+          const fp = row.file_path;
+          if (!fp || matched.has(fp)) continue;
+          if (looksLikeMinifiedBundle(row.content)) matched.add(fp);
+        }
+
+        if (args.dry_run) {
+          let chunksWould = 0;
+          let symbolsWould = 0;
+          const countChunksStmt = db.prepare(
+            `SELECT COUNT(1) AS c
+             FROM memory_items
+             WHERE file_path = ?
+               AND (kind = 'code_chunk' OR kind = 'doc_chunk')`,
+          );
+          const countSymbolsStmt = db.prepare(`SELECT COUNT(1) AS c FROM symbols WHERE file_path = ?`);
+          for (const fp of matched) {
+            chunksWould += Number((countChunksStmt.get(fp) as { c: number } | undefined)?.c ?? 0);
+            symbolsWould += Number((countSymbolsStmt.get(fp) as { c: number } | undefined)?.c ?? 0);
+          }
+          result.pruned.minified_bundles = {
+            files_matched: matched.size,
+            chunks_deleted: chunksWould,
+            symbols_deleted: symbolsWould,
+          };
+        } else {
+          let chunksDeleted = 0;
+          let symbolsDeleted = 0;
+          const tx = db.transaction(() => {
+            for (const fp of matched) {
+              chunksDeleted += deleteFileChunkItemsStmt.run(fp).changes;
+              symbolsDeleted += deleteSymbolsForFileStmt.run(fp).changes;
+            }
+          });
+          try {
+            tx();
+          } catch (err) {
+            console.error("[vectormind] prune minified bundles failed:", err);
+          }
+          if (matched.size) {
+            logActivity("index_prune", {
+              reason: "minified_bundles",
+              files_matched: matched.size,
+              chunks_deleted: chunksDeleted,
+              symbols_deleted: symbolsDeleted,
+            });
+          }
+          result.pruned.minified_bundles = {
+            files_matched: matched.size,
+            chunks_deleted: chunksDeleted,
+            symbols_deleted: symbolsDeleted,
+          };
+        }
+      }
+
+      if (!args.dry_run && args.vacuum) {
+        try {
+          db.exec("VACUUM");
+          logActivity("index_prune", { reason: "vacuum" });
+        } catch (err) {
+          console.error("[vectormind] vacuum failed:", err);
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson(result),
           },
         ],
       };
@@ -1995,6 +2962,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "sync_change_intent") {
       const args = SyncChangeIntentArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
       const explicitFiles = (args.files ?? args.affected_files ?? []).filter(
         (f): f is string => typeof f === "string" && f.length > 0,
       );
@@ -2005,15 +2973,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [
             {
               type: "text",
-              text: JSON.stringify(
-                {
-                  ok: false,
-                  error:
-                    "No active requirement. Call start_requirement(title, background) before syncing change intent.",
-                },
-                null,
-                2,
-              ),
+              text: toolJson({
+                ok: false,
+                error:
+                  "No active requirement. Call start_requirement(title, background) before syncing change intent.",
+              }),
             },
           ],
         };
@@ -2121,20 +3085,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       insertTx();
 
+      logActivity("sync_change_intent", {
+        req_id: active.id,
+        title: active.title,
+        intent_preview: makePreviewText(args.intent, 200),
+        files: synced_files.slice(0, 25),
+        files_total: synced_files.length,
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ok: true,
-                linked_to_requirement: { id: active.id, title: active.title },
-                synced_files,
-                created,
-              },
-              null,
-              2,
-            ),
+            text: toolJson({
+              ok: true,
+              linked_to_requirement: { id: active.id, title: active.title },
+              synced_files,
+              created,
+            }),
           },
         ],
       };
@@ -2142,14 +3110,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "bootstrap_context") {
       const args = BootstrapContextArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
 
-      const recent = listRecentRequirementsStmt.all(5) as RequirementRow[];
+      const previewChars = args.preview_chars;
+      const includeContent = args.include_content;
+      const contentMaxChars = args.content_max_chars;
+      const requirementsLimit = args.requirements_limit;
+      const changesLimit = args.changes_limit;
+      const notesLimit = args.notes_limit;
+      const conventionsLimit = args.conventions_limit;
+
+      const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
-        const changes = listChangeLogsForRequirementStmt.all(req.id, 20) as ChangeLogRow[];
-        return { requirement: req, recent_changes: changes };
+        const changes = listChangeLogsForRequirementStmt.all(req.id, changesLimit) as ChangeLogRow[];
+        return {
+          requirement: toRequirementPreview(req, includeContent, previewChars, contentMaxChars),
+          recent_changes: changes.map((c) => toChangeLogPreview(c, includeContent, previewChars, contentMaxChars)),
+        };
       });
-      const project_summary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-      const recent_notes = listRecentNotesStmt.all(10) as MemoryItemRow[];
+      const projectSummaryRow = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
+      const project_summary = projectSummaryRow
+        ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
+        : null;
+      const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
+        toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
+      );
+      const conventions = (listConventionsStmt.all(conventionsLimit) as MemoryItemRow[]).map((c) =>
+        toMemoryItemPreview(c, false, previewChars, contentMaxChars),
+      );
       const pending_total = Number(
         (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
       );
@@ -2171,7 +3159,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 query: q,
                 topK: args.top_k,
                 kinds: args.kinds?.length ? args.kinds : null,
-                includeContent: args.include_content,
+                includeContent,
+                previewChars,
+                contentMaxChars,
               }),
               new Promise<null>((resolve) => setTimeout(resolve, BOOTSTRAP_SEMANTIC_TIMEOUT_MS, null)),
             ]).catch((err) => {
@@ -2180,37 +3170,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             })
           : null;
 
+      logActivity("bootstrap_context", {
+        query: q || null,
+        pending_total,
+        pending_returned: pending_changes.length,
+        requirements_returned: items.length,
+        conventions_returned: conventions.length,
+        semantic_mode: semantic?.mode ?? null,
+        semantic_matches: semantic?.matches?.length ?? 0,
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ok: true,
-                generated_at: new Date().toISOString(),
-                project_root: projectRoot,
-                root_source: rootSource,
-                db_path: dbPath,
-                watcher_enabled: !!watcher,
-                watcher_ready: watcherReady,
-                embeddings: {
-                  enabled: embeddingsEnabled,
-                  model: embedModelName,
-                  embed_files: embedFilesMode,
-                },
-                project_summary: project_summary ?? null,
-                recent_notes,
-                pending_total,
-                pending_offset,
-                pending_limit,
-                pending_truncated,
-                pending_changes,
-                items,
-                semantic,
+            text: toolJson({
+              ok: true,
+              generated_at: new Date().toISOString(),
+              project_root: projectRoot,
+              root_source: rootSource,
+              db_path: dbPath,
+              watcher_enabled: !!watcher,
+              watcher_ready: watcherReady,
+              embeddings: {
+                enabled: embeddingsEnabled,
+                model: embedModelName,
+                embed_files: embedFilesMode,
               },
-              null,
-              2,
-            ),
+              output: {
+                include_content: includeContent,
+                preview_chars: previewChars,
+                content_max_chars: contentMaxChars,
+                requirements_limit: requirementsLimit,
+                changes_limit: changesLimit,
+                notes_limit: notesLimit,
+                conventions_limit: conventionsLimit,
+              },
+              project_summary,
+              conventions,
+              recent_notes,
+              pending_total,
+              pending_offset,
+              pending_limit,
+              pending_truncated,
+              pending_changes,
+              items,
+              semantic,
+            }),
           },
         ],
       };
@@ -2218,13 +3224,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "get_brain_dump") {
       const args = GetBrainDumpArgsSchema.parse(rawArgs);
-      const recent = listRecentRequirementsStmt.all(5) as RequirementRow[];
+      flushPendingChangeBuffer();
+      const previewChars = args.preview_chars;
+      const includeContent = args.include_content;
+      const contentMaxChars = args.content_max_chars;
+      const requirementsLimit = args.requirements_limit;
+      const changesLimit = args.changes_limit;
+      const notesLimit = args.notes_limit;
+      const conventionsLimit = args.conventions_limit;
+
+      const recent = listRecentRequirementsStmt.all(requirementsLimit) as RequirementRow[];
       const items = recent.map((req) => {
-        const changes = listChangeLogsForRequirementStmt.all(req.id, 20) as ChangeLogRow[];
-        return { requirement: req, recent_changes: changes };
+        const changes = listChangeLogsForRequirementStmt.all(req.id, changesLimit) as ChangeLogRow[];
+        return {
+          requirement: toRequirementPreview(req, includeContent, previewChars, contentMaxChars),
+          recent_changes: changes.map((c) => toChangeLogPreview(c, includeContent, previewChars, contentMaxChars)),
+        };
       });
-      const project_summary = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
-      const recent_notes = listRecentNotesStmt.all(10) as MemoryItemRow[];
+      const projectSummaryRow = getProjectSummaryStmt.get() as MemoryItemRow | undefined;
+      const project_summary = projectSummaryRow
+        ? toMemoryItemPreview(projectSummaryRow, includeContent, previewChars, contentMaxChars)
+        : null;
+      const recent_notes = (listRecentNotesStmt.all(notesLimit) as MemoryItemRow[]).map((n) =>
+        toMemoryItemPreview(n, includeContent, previewChars, contentMaxChars),
+      );
+      const conventions = (listConventionsStmt.all(conventionsLimit) as MemoryItemRow[]).map((c) =>
+        toMemoryItemPreview(c, false, previewChars, contentMaxChars),
+      );
       const pending_total = Number(
         (countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0,
       );
@@ -2238,36 +3264,50 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         updated_at: string;
       }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
 
+      logActivity("get_brain_dump", {
+        pending_total,
+        pending_returned: pending_changes.length,
+        requirements_returned: items.length,
+        notes_returned: recent_notes.length,
+        conventions_returned: conventions.length,
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ok: true,
-                generated_at: new Date().toISOString(),
-                project_root: projectRoot,
-                root_source: rootSource,
-                db_path: dbPath,
-                watcher_enabled: !!watcher,
-                watcher_ready: watcherReady,
-                embeddings: {
-                  enabled: embeddingsEnabled,
-                  model: embedModelName,
-                  embed_files: embedFilesMode,
-                },
-                project_summary: project_summary ?? null,
-                recent_notes,
-                pending_total,
-                pending_offset,
-                pending_limit,
-                pending_truncated,
-                pending_changes,
-                items,
+            text: toolJson({
+              ok: true,
+              generated_at: new Date().toISOString(),
+              project_root: projectRoot,
+              root_source: rootSource,
+              db_path: dbPath,
+              watcher_enabled: !!watcher,
+              watcher_ready: watcherReady,
+              embeddings: {
+                enabled: embeddingsEnabled,
+                model: embedModelName,
+                embed_files: embedFilesMode,
               },
-              null,
-              2,
-            ),
+              output: {
+                include_content: includeContent,
+                preview_chars: previewChars,
+                content_max_chars: contentMaxChars,
+                requirements_limit: requirementsLimit,
+                changes_limit: changesLimit,
+                notes_limit: notesLimit,
+                conventions_limit: conventionsLimit,
+              },
+              project_summary,
+              conventions,
+              recent_notes,
+              pending_total,
+              pending_offset,
+              pending_limit,
+              pending_truncated,
+              pending_changes,
+              items,
+            }),
           },
         ],
       };
@@ -2275,6 +3315,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     if (toolName === "get_pending_changes") {
       const args = GetPendingChangesArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
       const total = Number((countPendingChangesStmt.get() as { total: number } | undefined)?.total ?? 0);
       const offset = args.offset;
       const limit = args.limit;
@@ -2286,14 +3327,187 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         updated_at: string;
       }>).filter((p) => !shouldIgnoreDbFilePath(p.file_path));
 
+      logActivity("get_pending_changes", {
+        total,
+        offset,
+        limit,
+        returned: pending.length,
+        truncated,
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, total, offset, limit, truncated, pending }, null, 2),
+            text: toolJson({ ok: true, total, offset, limit, truncated, pending }),
           },
         ],
       };
+    }
+
+    if (toolName === "complete_requirement") {
+      const args = CompleteRequirementArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+
+      const updated: Array<{ id: number }> = [];
+      if (args.all_active) {
+        const activeRows = (db.prepare(
+          `SELECT id FROM requirements WHERE status = 'active' ORDER BY created_at DESC, id DESC`,
+        ).all() as Array<{ id: number }>).slice(0, 200);
+
+        try {
+          completeAllActiveRequirementsStmt.run();
+          completeAllActiveRequirementMemoryItems();
+        } catch (err) {
+          console.error("[vectormind] complete all active requirements failed:", err);
+        }
+
+        for (const r of activeRows) updated.push({ id: r.id });
+        logActivity("complete_requirement", { all_active: true, completed: updated.map((u) => u.id) });
+        return { content: [{ type: "text", text: toolJson({ ok: true, completed: updated }) }] };
+      }
+
+      const targetId =
+        args.req_id ?? (getActiveRequirementStmt.get() as RequirementRow | undefined)?.id ?? null;
+      if (!targetId) {
+        return { content: [{ type: "text", text: toolJson({ ok: true, completed: [] }) }] };
+      }
+
+      try {
+        completeRequirementByIdStmt.run(targetId);
+        completeRequirementMemoryItemsByReqId(targetId);
+      } catch (err) {
+        console.error("[vectormind] complete requirement failed:", err);
+      }
+
+      logActivity("complete_requirement", { req_id: targetId });
+      return { content: [{ type: "text", text: toolJson({ ok: true, completed: [{ id: targetId }] }) }] };
+    }
+
+    if (toolName === "read_memory_item") {
+      const args = ReadMemoryItemArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const row = getMemoryItemByIdStmt.get(args.id) as MemoryItemRow | undefined;
+      if (!row) {
+        return { isError: true, content: [{ type: "text", text: toolJson({ ok: false, error: "Not found" }) }] };
+      }
+
+      const total = row.content.length;
+      const offset = args.offset;
+      const limit = args.limit;
+      const chunk = row.content.slice(offset, offset + limit);
+      const truncated = offset + limit < total;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              item: {
+                id: row.id,
+                kind: row.kind,
+                title: row.title,
+                file_path: row.file_path,
+                start_line: row.start_line,
+                end_line: row.end_line,
+                req_id: row.req_id,
+                metadata_json: row.metadata_json,
+                updated_at: row.updated_at,
+              },
+              total_chars: total,
+              offset,
+              limit,
+              truncated,
+              content: chunk,
+            }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "get_activity_log") {
+      const args = GetActivityLogArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const { events, last_id } = snapshotActivityLog({ sinceId: args.since_id, limit: args.limit });
+      const outEvents = args.verbose
+        ? events
+        : events.map((e) => ({ id: e.id, ts: e.ts, type: e.type, summary: summarizeActivityEvent(e) }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              enabled: debugLogEnabled,
+              max_entries: debugLogMaxEntries,
+              last_id,
+              events: outEvents,
+            }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "get_activity_summary") {
+      const args = GetActivitySummaryArgsSchema.parse(rawArgs);
+      flushPendingChangeBuffer();
+      const { events, last_id } = snapshotActivityLog({ sinceId: args.since_id, limit: 500 });
+
+      const counts: Record<string, number> = {};
+      const indexedFiles = new Set<string>();
+      let semanticCount = 0;
+      let queryCodebaseCount = 0;
+      let pendingFlushes = 0;
+      let pendingPrunes = 0;
+      let lastSemantic: Record<string, unknown> | null = null;
+      let lastQueryCodebase: Record<string, unknown> | null = null;
+
+      for (const e of events) {
+        counts[e.type] = (counts[e.type] ?? 0) + 1;
+        if (e.type === "index_file") {
+          const fp = String(e.data.file_path ?? "");
+          if (fp) indexedFiles.add(fp);
+        }
+        if (e.type === "semantic_search") {
+          semanticCount += 1;
+          lastSemantic = e.data;
+        }
+        if (e.type === "query_codebase") {
+          queryCodebaseCount += 1;
+          lastQueryCodebase = e.data;
+        }
+        if (e.type === "pending_flush") pendingFlushes += 1;
+        if (e.type === "pending_prune") pendingPrunes += 1;
+      }
+
+      const sampleFiles = Array.from(indexedFiles).slice(0, args.max_files);
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              enabled: debugLogEnabled,
+              last_id,
+              since_id: args.since_id,
+              counts,
+              indexed_files: { unique: indexedFiles.size, sample: sampleFiles },
+              searches: {
+                semantic_search: { count: semanticCount, last: lastSemantic },
+                query_codebase: { count: queryCodebaseCount, last: lastQueryCodebase },
+              },
+              pending: { flushes: pendingFlushes, prunes: pendingPrunes },
+            }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "clear_activity_log") {
+      ClearActivityLogArgsSchema.parse(rawArgs);
+      clearActivityLog();
+      return { content: [{ type: "text", text: toolJson({ ok: true }) }] };
     }
 
     if (toolName === "query_codebase") {
@@ -2304,11 +3518,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const rows = searchSymbolsStmt.all(like, like, q, like, 250) as SymbolRow[];
       const filtered = rows.filter((r) => !shouldIgnoreDbFilePath(r.file_path)).slice(0, 50);
 
+      logActivity("query_codebase", {
+        query: q,
+        matches: filtered.length,
+        sample: filtered.slice(0, 10).map((m) => ({ name: m.name, type: m.type, file_path: m.file_path })),
+      });
+
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, query: q, matches: filtered }, null, 2),
+            text: toolJson({ ok: true, query: q, matches: filtered }),
           },
         ],
       };
@@ -2327,11 +3547,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              { ok: true, project_summary: row ?? null },
-              null,
-              2,
-            ),
+            text: toolJson({
+              ok: true,
+              project_summary: row ? { id: row.id, updated_at: row.updated_at } : null,
+            }),
           },
         ],
       };
@@ -2359,7 +3578,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: true, note: { id } }, null, 2),
+            text: toolJson({ ok: true, note: { id } }),
+          },
+        ],
+      };
+    }
+
+    if (toolName === "upsert_convention") {
+      const args = UpsertConventionArgsSchema.parse(rawArgs);
+      const key = args.key.trim();
+      const content = args.content.trim();
+      const contentHash = sha256Hex(content);
+      const meta = safeJson({ tags: args.tags ?? [] });
+      const existing = getConventionByKeyStmt.get(key) as MemoryItemRow | undefined;
+      if (existing) {
+        updateConventionByIdStmt.run(content, meta, contentHash, existing.id);
+      } else {
+        insertConventionStmt.run(key, content, meta, contentHash);
+      }
+      const row = getConventionByKeyStmt.get(key) as MemoryItemRow | undefined;
+
+      if (row) enqueueEmbedding(row.id);
+      logActivity("upsert_convention", { key, content_preview: makePreviewText(content, 200) });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: toolJson({
+              ok: true,
+              convention: row
+                ? {
+                    id: row.id,
+                    key: row.title,
+                    updated_at: row.updated_at,
+                    preview: makePreviewText(row.content, DEFAULT_PREVIEW_CHARS),
+                  }
+                : null,
+            }),
           },
         ],
       };
@@ -2372,17 +3628,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         topK: args.top_k,
         kinds: args.kinds?.length ? args.kinds : null,
         includeContent: args.include_content,
+        previewChars: args.preview_chars,
+        contentMaxChars: args.content_max_chars,
+      });
+
+      logActivity("semantic_search", {
+        query: result.query,
+        mode: result.mode,
+        top_k: result.top_k,
+        matches: result.matches.length,
+        sample: result.matches.slice(0, 10).map((m) => ({
+          id: m.item.id,
+          kind: m.item.kind,
+          file_path: m.item.file_path,
+          score: m.score,
+        })),
       });
 
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              { ok: true, ...result },
-              null,
-              2,
-            ),
+            text: toolJson({ ok: true, ...result }),
           },
         ],
       };
@@ -2405,6 +3672,7 @@ await server.connect(transport);
 
 async function shutdown(signal: string): Promise<void> {
   try {
+    flushPendingChangeBuffer();
     await watcher?.close();
   } catch (err) {
     console.error("[vectormind] watcher close error:", err);
